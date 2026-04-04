@@ -301,13 +301,13 @@ class FinalmouseTray:
         return tip
 
     def _charging_animation(self):
-        """Animate the tray icon while charging — green pulse cycle."""
+        """Animate the tray icon while charging — red pulse cycle."""
         frame = 0
         while self.running and self.is_charging:
-            # Sine wave pulse: brightness cycles between 80 and 255
-            t = (frame % 30) / 30.0  # 0.0 to 1.0 over 30 frames
+            # Sine wave pulse: red channel cycles 80-255, slight dark red tint
+            t = (frame % 30) / 30.0
             brightness = int(80 + 175 * (0.5 + 0.5 * math.sin(2 * math.pi * t)))
-            color = (0, brightness, 0, 255)  # green pulse
+            color = (brightness, int(brightness * 0.15), int(brightness * 0.1), 255)  # dark red to light red
 
             # Show the current battery number (or lightning bolt char)
             display = self.battery_pct if self.battery_pct != "..." else "C"
