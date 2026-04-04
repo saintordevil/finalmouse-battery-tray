@@ -1,0 +1,4 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\WebHidAllowDevicesForUrls]
+"1"="{\"devices\":[{\"vendor_id\":13853,\"product_id\":256},{\"vendor_id\":13853,\"product_id\":257},{\"vendor_id\":13853,\"product_id\":258},{\"vendor_id\":13853,\"product_id\":260}],\"urls\":[\"https://xpanel.finalmouse.com\"]}"
