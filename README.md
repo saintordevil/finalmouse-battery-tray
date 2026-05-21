@@ -1,70 +1,140 @@
-# Finalmouse ULX Battery Tray Monitor
+# Finalmouse Battery Tray
 
-A lightweight Windows system tray utility that displays your Finalmouse ULX mouse battery percentage in real time.
+Windows tray monitor for Finalmouse ULX battery status. It keeps a hidden Chrome session connected to Finalmouse Xpanel and renders the battery percentage directly in the system tray.
 
-## How It Works
+The app is designed for a quiet daily setup: no visible browser, no console window, low polling overhead, manual recovery controls, and charge history in the tray tooltip.
 
-The app launches a hidden Chrome instance pointed at [xpanel.finalmouse.com](https://xpanel.finalmouse.com/overview) and reads the battery level directly from the page DOM. The percentage is rendered as the system tray icon itself — no extra windows, no clutter.
+## Features
 
-- Polls battery every 10 seconds (low overhead — just reads a DOM element)
-- Displays the current percentage as the tray icon with bold, readable text
-- Animates a green pulse when the mouse is charging
-- Tracks the last time and percentage at which charging began (shown in tooltip)
-- Automatically refreshes the page on connection loss or state transitions
-- Runs completely hidden — no console window, no visible browser
+| Feature | Details |
+|---|---|
+| Tray battery icon | Shows the current battery percentage as the tray icon |
+| Consistent text size | Keeps `100` visually aligned with `0` through `99` |
+| Hidden browser session | Uses an isolated Chrome profile for Xpanel |
+| Manual refresh | Right-click `Refresh` reloads Xpanel and falls back to browser restart if needed |
+| Manual reconnect | Right-click `Reconnect Browser` restarts only the app-owned browser session |
+| Last charged tooltip | Shows when the mouse last finished charging, from percent, to percent, and duration |
+| Text color toggle | Right-click `Dark text` to switch the tray number from white to black |
+| Watchdog recovery | Restarts the isolated browser if Chrome disappears or polling gets stale |
+| Restart safety | Uses locks, cooldowns, and restart limits to avoid Chrome restart loops |
+| Safer cleanup | Kills only Chrome processes tied to the isolated Finalmouse profile |
 
 ## Requirements
 
-- **Windows 10/11**
-- **Python 3.10+**
-- **Google Chrome** installed
-- Python packages:
-  ```
-  pip install pystray pillow selenium
-  ```
+* Windows 10 or Windows 11
+* Python 3.10+
+* Google Chrome
+* Python packages:
 
-## Setup
+```powershell
+pip install pystray pillow selenium
+```
 
-### 1. Chrome WebHID Policy (Required)
+## Install
 
-Finalmouse Xpanel uses WebHID to communicate with the mouse. Chrome requires a policy to allow this automatically (without a manual prompt in the hidden browser).
+Clone the repo or download the folder, then install dependencies:
 
-Run `setup_policy.reg` as Administrator to add the required registry key. This permits `xpanel.finalmouse.com` to access Finalmouse USB devices.
+```powershell
+cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+pip install pystray pillow selenium
+```
 
-### 2. First-Time Browser Login
+## Chrome WebHID Policy
 
-The app uses an isolated Chrome profile stored in `%LOCALAPPDATA%\finalmouse-tray\chrome-isolated`. On first launch, Xpanel may need you to pair/connect the mouse:
+Finalmouse Xpanel uses WebHID to talk to the mouse. Chrome needs a policy entry so the hidden browser can access the mouse without a visible permission prompt.
 
-1. Temporarily edit `finalmouse_tray.py` and comment out the `--window-position=-32000,-32000` line
-2. Run `start.bat`
-3. Complete any pairing prompts in the Chrome window
-4. Stop the app with `stop.bat`, restore the line, and relaunch — it will connect automatically from then on
+Run `setup_policy.reg` as Administrator before first use.
+
+## First Run
+
+The app stores its isolated Chrome profile in:
+
+```text
+%LOCALAPPDATA%\finalmouse-tray\chrome-isolated
+```
+
+If Xpanel needs a first-time login, pairing, or permission approval:
+
+1. Temporarily edit `finalmouse_tray.py`.
+2. Comment out the `--window-position=-32000,-32000` line.
+3. Run `start.bat`.
+4. Complete the Xpanel setup in Chrome.
+5. Stop the app with `stop.bat`.
+6. Restore the hidden window line and start the app again.
 
 ## Usage
 
-| Action | Command |
-|--------|---------|
-| **Start** | Double-click `start.bat` (or use `finalmouse_tray_silent.vbs` for zero windows) |
-| **Stop** | Double-click `stop.bat` |
+```powershell
+cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+.\start.bat
+```
 
-Once running, look for the battery percentage number in your system tray. Right-click the icon for **Refresh** or **Quit**.
+Stop the app:
 
-### Run at Startup (Optional)
+```powershell
+cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+.\stop.bat
+```
 
-To launch automatically when Windows starts:
+For a silent launch with no console window, run:
 
-1. Press `Win + R`, type `shell:startup`, press Enter
-2. Create a shortcut to `finalmouse_tray_silent.vbs` in that folder
+```powershell
+cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+wscript .\finalmouse_tray_silent.vbs
+```
+
+## Tray Menu
+
+| Menu item | Action |
+|---|---|
+| `Refresh` | Reloads Xpanel, waits for a fresh read, then restarts the browser if refresh fails |
+| `Reconnect Browser` | Forces a clean restart of the isolated browser session |
+| `Dark text` | Toggles the tray icon number between white and black text |
+| `Quit` | Stops the tray app and cleans up app-owned browser processes |
+
+## Charge History
+
+The tooltip tracks completed charge sessions:
+
+```text
+Last charged: 21/05 10:42pm, 54% to 100% in 1h 18m
+```
+
+While charging, it shows the active session start:
+
+```text
+Charging from 54% since 21/05 09:24pm
+```
+
+Charge and settings data are stored in:
+
+```text
+%LOCALAPPDATA%\finalmouse-tray\charge_log.json
+%LOCALAPPDATA%\finalmouse-tray\settings.json
+%LOCALAPPDATA%\finalmouse-tray\tray.log
+```
+
+## Reliability Notes
+
+* Automatic recovery uses a real page refresh first.
+* If Selenium reports that Chrome is gone, the app restarts the browser.
+* A low-frequency watchdog checks that the poll thread and tracked Chrome process are still alive.
+* Automatic browser restarts are limited to 4 attempts per 5 minutes.
+* Automatic browser restarts have a 30 second cooldown.
+* Manual `Refresh` can force a restart if a normal page refresh does not recover the battery read.
+* Menu actions are serialized so refresh and reconnect cannot fight each other.
+* Cleanup verifies the isolated Chrome profile path before killing Chrome.
 
 ## File Overview
 
 | File | Purpose |
-|------|---------|
-| `finalmouse_tray.py` | Main application — tray icon, browser control, battery polling |
-| `start.bat` | Launches the tray app minimized |
-| `stop.bat` | Kills the tray app and any associated Chrome processes |
-| `finalmouse_tray_silent.vbs` | Launches the app with no console window at all |
-| `setup_policy.reg` | Registry policy to allow WebHID access for Finalmouse devices |
+|---|---|
+| `finalmouse_tray.py` | Tray app, browser control, battery polling, charge tracking |
+| `start.bat` | Starts the tray app minimized with `pythonw` |
+| `stop.bat` | Stops the tray app through the PowerShell cleanup helper |
+| `stop_finalmouse.ps1` | Dependency-free process cleanup for tray and app-owned Chrome processes |
+| `finalmouse_tray_silent.vbs` | Starts the tray app without a console window |
+| `setup_policy.reg` | Chrome WebHID policy for Finalmouse Xpanel |
 
 ## License
 
