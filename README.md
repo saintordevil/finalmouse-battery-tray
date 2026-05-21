@@ -35,7 +35,7 @@ pip install pystray pillow selenium
 Clone the repo or download the folder, then install dependencies:
 
 ```powershell
-cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
 pip install pystray pillow selenium
 ```
 
@@ -65,21 +65,21 @@ If Xpanel needs a first-time login, pairing, or permission approval:
 ## Usage
 
 ```powershell
-cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
 .\start.bat
 ```
 
 Stop the app:
 
 ```powershell
-cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
 .\stop.bat
 ```
 
 For a silent launch with no console window, run:
 
 ```powershell
-cd C:\Users\saint\Desktop\Programs\finalmouse-battery-tray-github
+cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
 wscript .\finalmouse_tray_silent.vbs
 ```
 
