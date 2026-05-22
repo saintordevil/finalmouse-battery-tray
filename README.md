@@ -12,6 +12,7 @@ The app is designed for a quiet daily setup: no visible browser, no console wind
 | Consistent text size | Keeps `100` visually aligned with `0` through `99` |
 | Hidden browser session | Uses an isolated Chrome profile for Xpanel |
 | Manual refresh | Right-click `Refresh` reloads Xpanel and falls back to browser restart if needed |
+| Scheduled refresh | Reloads Xpanel every 60 seconds so stale hidden tabs do not freeze the percentage |
 | Manual reconnect | Right-click `Reconnect Browser` restarts only the app-owned browser session |
 | Last charged tooltip | Shows when the mouse last finished charging, from percent, to percent, and duration |
 | Text color toggle | Right-click `Dark text` to switch the tray number from white to black |
@@ -117,8 +118,11 @@ Charge and settings data are stored in:
 ## Reliability Notes
 
 * Automatic recovery uses a real page refresh first.
+* The hidden Xpanel tab is refreshed every 60 seconds to pick up battery changes and charging transitions.
+* A visible Xpanel `Connect` state takes priority over stale battery text when deciding whether the mouse is charging.
 * If Selenium reports that Chrome is gone, the app restarts the browser.
 * A low-frequency watchdog checks that the poll thread and tracked Chrome process are still alive.
+* If Selenium holds the browser lock too long, the watchdog cleans up only the app-owned browser processes so polling can recover.
 * Automatic browser restarts are limited to 4 attempts per 5 minutes.
 * Automatic browser restarts have a 30 second cooldown.
 * Manual `Refresh` can force a restart if a normal page refresh does not recover the battery read.

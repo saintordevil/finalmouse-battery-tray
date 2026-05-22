@@ -28,6 +28,7 @@ HIDER_INTERVAL = 5
 PID_REFRESH_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 30
 WATCHDOG_STALE_SECONDS = 90
+PAGE_REFRESH_INTERVAL_SECONDS = 60
 STARTUP_SETTLE_SECONDS = 3
 REFRESH_SETTLE_SECONDS = 5
 CHARGING_ANIMATION_INTERVAL = 0.5
@@ -578,6 +579,8 @@ class FinalmouseTray:
         now = time.monotonic()
         self.last_poll_heartbeat = now
         self.last_successful_read_at = 0
+        self.last_page_refresh_at = 0
+        self.last_forced_cleanup_at = 0
         self.charge_log = load_charge_log()
         self._migrate_charge_log()
         self.settings = load_settings()
@@ -702,6 +705,7 @@ class FinalmouseTray:
 
                 self.driver.get(XPANEL_URL)
                 time.sleep(2)
+                self.last_page_refresh_at = time.monotonic()
                 self._track_browser_pids()
 
                 if not self.hider_thread or not self.hider_thread.is_alive():
@@ -811,16 +815,18 @@ class FinalmouseTray:
             log_event("Browser read failed: driver is not initialized")
             return BROWSER_ERROR
         try:
-            els = self.driver.find_elements(By.CSS_SELECTOR, ".battery-text")
-            for el in els:
-                reading = normalize_reading(el.text)
-                if parse_percent(reading) is not None:
-                    return reading
-
             buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
             for btn in buttons:
                 if btn.text.strip() == "Connect" and btn.is_displayed():
                     return "charging"
+
+            els = self.driver.find_elements(By.CSS_SELECTOR, ".battery-text")
+            for el in els:
+                if not el.is_displayed():
+                    continue
+                reading = normalize_reading(el.text)
+                if parse_percent(reading) is not None:
+                    return reading
 
             body_text = self.driver.find_element(By.TAG_NAME, "body").text
             reading = normalize_reading(body_text)
@@ -865,6 +871,7 @@ class FinalmouseTray:
             try:
                 self.driver.refresh()
                 time.sleep(REFRESH_SETTLE_SECONDS)
+                self.last_page_refresh_at = time.monotonic()
                 reading = self._read_battery_locked()
             except WebDriverException as e:
                 log_event(f"Refresh failed: {e.__class__.__name__}: {str(e)[:250]}")
@@ -879,6 +886,12 @@ class FinalmouseTray:
                 f"{reason}; refresh did not recover",
                 force=force_restart_on_failure,
             )
+
+    def _page_refresh_due(self):
+        return (
+            time.monotonic() - self.last_page_refresh_at
+            >= PAGE_REFRESH_INTERVAL_SECONDS
+        )
 
     def _build_tooltip(self):
         if self.is_charging:
@@ -1048,7 +1061,10 @@ class FinalmouseTray:
         while self.running:
             self.last_poll_heartbeat = time.monotonic()
             try:
-                reading = self.read_battery()
+                if self._page_refresh_due():
+                    reading = self.recover_browser("scheduled page refresh")
+                else:
+                    reading = self.read_battery()
                 if reading == BROWSER_ERROR:
                     reading = self.restart_browser("lost Selenium browser connection")
                     prev_state = None
@@ -1116,12 +1132,15 @@ class FinalmouseTray:
             log_event("Poll thread was not running; starting a new poll thread")
             self._start_poll_thread()
 
+        stale_for = time.monotonic() - self.last_poll_heartbeat
         if not self.browser_lock.acquire(blocking=False):
-            log_event("Watchdog skipped because browser work is already running")
+            if stale_for > WATCHDOG_STALE_SECONDS:
+                self._force_cleanup_stuck_browser(stale_for)
+            else:
+                log_event("Watchdog skipped because browser work is already running")
             return
 
         try:
-            stale_for = time.monotonic() - self.last_poll_heartbeat
             missing_browser = not self.driver or not self._has_live_browser_process()
             stale_poll = stale_for > WATCHDOG_STALE_SECONDS
 
@@ -1145,6 +1164,21 @@ class FinalmouseTray:
                 self.action_lock.release()
         finally:
             self.browser_lock.release()
+
+    def _force_cleanup_stuck_browser(self, stale_for):
+        now = time.monotonic()
+        if now - self.last_forced_cleanup_at < RESTART_COOLDOWN_SECONDS:
+            log_event(
+                "Watchdog skipped stuck-browser cleanup by cooldown, "
+                f"poll stale for {int(stale_for)}s"
+            )
+            return
+        self.last_forced_cleanup_at = now
+        log_event(
+            "Watchdog forcing browser cleanup to unblock Selenium, "
+            f"poll stale for {int(stale_for)}s"
+        )
+        cleanup_tracked_processes()
 
     def _run_menu_action(self, label, target):
         def runner():
