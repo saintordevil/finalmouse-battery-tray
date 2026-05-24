@@ -604,6 +604,11 @@ class FinalmouseTray:
                 changed = True
 
         pending = self.charge_log.get("pending_charge")
+        if pending and pending.get("start_pct") is None:
+            self.charge_log.pop("pending_charge", None)
+            changed = True
+            log_event("Cleared pending charge without a start percent")
+            pending = None
         if pending and self._pending_charge_age_seconds(pending) > MAX_PENDING_CHARGE_SECONDS:
             self.charge_log.pop("pending_charge", None)
             changed = True
@@ -815,11 +820,6 @@ class FinalmouseTray:
             log_event("Browser read failed: driver is not initialized")
             return BROWSER_ERROR
         try:
-            buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
-            for btn in buttons:
-                if btn.text.strip() == "Connect" and btn.is_displayed():
-                    return "charging"
-
             els = self.driver.find_elements(By.CSS_SELECTOR, ".battery-text")
             for el in els:
                 if not el.is_displayed():
@@ -827,6 +827,12 @@ class FinalmouseTray:
                 reading = normalize_reading(el.text)
                 if parse_percent(reading) is not None:
                     return reading
+
+            buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
+            for btn in buttons:
+                if btn.text.strip() == "Connect" and btn.is_displayed():
+                    log_event("Xpanel shows Connect without a visible battery percent; retrying")
+                    return None
 
             body_text = self.driver.find_element(By.TAG_NAME, "body").text
             reading = normalize_reading(body_text)
@@ -923,16 +929,20 @@ class FinalmouseTray:
 
     def _start_charge_session(self):
         if self.charge_log.get("pending_charge"):
-            return
+            return True
         start_pct = parse_percent(self.battery_pct)
         if start_pct is None:
             start_pct = self.charge_log.get("last_known_pct")
+        if start_pct is None:
+            log_event("Ignored charging state without a start percent; retrying battery read")
+            return False
         self.charge_log["pending_charge"] = {
             "start_pct": start_pct,
             "started_at": datetime.now().isoformat(timespec="seconds"),
         }
         save_charge_log(self.charge_log)
         log_event(f"Charge session started from {format_pct(start_pct)}")
+        return True
 
     def _finish_charge_session(self, end_pct):
         pending = self.charge_log.get("pending_charge")
@@ -1008,7 +1018,7 @@ class FinalmouseTray:
                 pending = self.charge_log.get("pending_charge") or {}
                 display = format_pct(pending.get("start_pct"))
                 if display == "unknown":
-                    display = "C"
+                    display = "..."
             if self.icon:
                 self.icon.icon = create_battery_icon(display, color=color)
             frame += 1
@@ -1029,7 +1039,10 @@ class FinalmouseTray:
 
         if reading == "charging":
             if not self.is_charging:
-                self._start_charge_session()
+                if not self._start_charge_session():
+                    self.icon.icon = create_battery_icon(self.battery_pct, color=self._dim_text_color())
+                    self.icon.title = self._build_tooltip()
+                    return
                 self.is_charging = True
                 self._start_charging_anim()
             self.icon.title = self._build_tooltip()

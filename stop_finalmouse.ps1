@@ -19,7 +19,15 @@ function Same-CreationDate {
     if ([string]::IsNullOrWhiteSpace($Expected)) {
         return $false
     }
-    return ([string] $Process.CreationDate) -eq $Expected
+    if (([string] $Process.CreationDate) -eq $Expected) {
+        return $true
+    }
+    try {
+        $timestamp = ([DateTimeOffset] $Process.CreationDate).ToUnixTimeMilliseconds()
+        return "/Date($timestamp)/" -eq $Expected
+    } catch {
+        return $false
+    }
 }
 
 if (Test-Path -LiteralPath $lockFile) {
