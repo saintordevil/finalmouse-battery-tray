@@ -119,7 +119,8 @@ Charge and settings data are stored in:
 
 * Automatic recovery uses a real page refresh first.
 * The hidden Xpanel tab is refreshed every 60 seconds to pick up battery changes and charging transitions.
-* A visible battery percentage takes priority over Xpanel `Connect`; `Connect` by itself is treated as a retry state, not charging.
+* A visible battery percentage takes priority over Xpanel `Connect`, except `Connect` with `0%` is treated as charging recovery for a dead mouse.
+* `Connect` by itself is treated as a retry state, not charging.
 * If Selenium reports that Chrome is gone, the app restarts the browser.
 * A low-frequency watchdog checks that the poll thread and tracked Chrome process are still alive.
 * If Selenium holds the browser lock too long, the watchdog cleans up only the app-owned browser processes so polling can recover.

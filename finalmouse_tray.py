@@ -50,6 +50,7 @@ CHARGE_LOG = os.path.join(DATA_DIR, "charge_log.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LOG_FILE = os.path.join(DATA_DIR, "tray.log")
 BROWSER_ERROR = "__browser_error__"
+CHARGING_READING = "charging"
 
 FONT_CANDIDATES = [
     "segoeuib.ttf",
@@ -115,9 +116,11 @@ def log_event(message):
 
 
 def parse_percent(reading):
-    if reading is None or reading == BROWSER_ERROR or reading == "charging":
+    if reading is None or reading == BROWSER_ERROR:
         return None
     text = str(reading).strip()
+    if text == CHARGING_READING or text.startswith(f"{CHARGING_READING}:"):
+        return None
     match = re.search(r"\b(\d{1,3})\s*%", text)
     if not match and re.fullmatch(r"\d{1,3}", text):
         match = re.match(r"(\d{1,3})", text)
@@ -145,10 +148,26 @@ def normalize_reading(reading):
     return format_pct(pct)
 
 
+def is_charging_reading(reading):
+    if reading is None:
+        return False
+    text = str(reading).strip()
+    return text == CHARGING_READING or text.startswith(f"{CHARGING_READING}:")
+
+
+def charging_start_percent(reading):
+    if not is_charging_reading(reading):
+        return None
+    text = str(reading).strip()
+    if not text.startswith(f"{CHARGING_READING}:"):
+        return None
+    return parse_percent(text.split(":", 1)[1])
+
+
 def battery_state(reading):
     if reading == BROWSER_ERROR:
         return None
-    if reading == "charging":
+    if is_charging_reading(reading):
         return "charging"
     if parse_percent(reading) is not None:
         return "battery"
@@ -820,24 +839,41 @@ class FinalmouseTray:
             log_event("Browser read failed: driver is not initialized")
             return BROWSER_ERROR
         try:
+            visible_reading = None
+            visible_pct = None
             els = self.driver.find_elements(By.CSS_SELECTOR, ".battery-text")
             for el in els:
                 if not el.is_displayed():
                     continue
                 reading = normalize_reading(el.text)
-                if parse_percent(reading) is not None:
-                    return reading
+                pct = parse_percent(reading)
+                if pct is not None:
+                    visible_reading = reading
+                    visible_pct = pct
+                    break
 
+            connect_visible = False
             buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
             for btn in buttons:
                 if btn.text.strip() == "Connect" and btn.is_displayed():
-                    log_event("Xpanel shows Connect without a visible battery percent; retrying")
-                    return None
+                    connect_visible = True
+                    break
+
+            if visible_pct is not None:
+                if connect_visible and visible_pct == 0:
+                    return f"{CHARGING_READING}:0%"
+                return visible_reading
 
             body_text = self.driver.find_element(By.TAG_NAME, "body").text
             reading = normalize_reading(body_text)
-            if parse_percent(reading) is not None:
+            pct = parse_percent(reading)
+            if pct is not None:
+                if connect_visible and pct == 0:
+                    return f"{CHARGING_READING}:0%"
                 return reading
+            if connect_visible:
+                log_event("Xpanel shows Connect without a visible battery percent; retrying")
+                return None
             return None
         except WebDriverException as e:
             log_event(f"Browser read failed: {e.__class__.__name__}: {str(e)[:250]}")
@@ -927,10 +963,14 @@ class FinalmouseTray:
             )
         return tip
 
-    def _start_charge_session(self):
+    def _start_charge_session(self, start_pct=None):
         if self.charge_log.get("pending_charge"):
             return True
-        start_pct = parse_percent(self.battery_pct)
+        if start_pct is not None:
+            self.battery_pct = format_pct(start_pct)
+            self.charge_log["last_known_pct"] = start_pct
+        else:
+            start_pct = parse_percent(self.battery_pct)
         if start_pct is None:
             start_pct = self.charge_log.get("last_known_pct")
         if start_pct is None:
@@ -1037,9 +1077,10 @@ class FinalmouseTray:
         if not self.icon:
             return
 
-        if reading == "charging":
+        if is_charging_reading(reading):
+            start_pct = charging_start_percent(reading)
             if not self.is_charging:
-                if not self._start_charge_session():
+                if not self._start_charge_session(start_pct):
                     self.icon.icon = create_battery_icon(self.battery_pct, color=self._dim_text_color())
                     self.icon.title = self._build_tooltip()
                     return
