@@ -9,6 +9,7 @@ The app is designed for a quiet daily setup: no visible browser, no console wind
 | Feature | Details |
 |---|---|
 | Tray battery icon | Shows the current battery percentage as the tray icon |
+| Charging icon | Shows a pulsing lightning bolt while charging |
 | Consistent text size | Keeps `100` visually aligned with `0` through `99` |
 | Hidden browser session | Uses an isolated Chrome profile for Xpanel |
 | Manual refresh | Right-click `Refresh` reloads Xpanel and falls back to browser restart if needed |
@@ -119,7 +120,7 @@ Charge and settings data are stored in:
 
 * Automatic recovery uses a real page refresh first.
 * The hidden Xpanel tab is refreshed every 60 seconds to pick up battery changes and charging transitions.
-* A visible battery percentage takes priority over Xpanel `Connect`, except `Connect` with `0%` is treated as charging recovery for a dead mouse.
+* A visible battery percentage takes priority over Xpanel `Connect`, except `Connect` with `0%` is treated as charging recovery without overwriting the last known battery percent.
 * `Connect` by itself is treated as a retry state, not charging.
 * If Selenium reports that Chrome is gone, the app restarts the browser.
 * A low-frequency watchdog checks that the poll thread and tracked Chrome process are still alive.

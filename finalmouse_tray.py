@@ -227,6 +227,23 @@ def draw_centered_text(img, display_text, font, color):
     draw.text((x, y), display_text, fill=color, font=font)
 
 
+def create_charging_icon(color=(255, 255, 255, 255)):
+    """Create a centered lightning bolt that stays legible at tray size."""
+    size = 256
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    bolt = [
+        (145, 18),
+        (64, 142),
+        (116, 142),
+        (93, 238),
+        (192, 104),
+        (135, 104),
+    ]
+    draw.polygon(bolt, fill=color)
+    return img
+
+
 def create_battery_icon(percent_text, color=(255, 255, 255, 255)):
     """Create a system tray icon with stable visual height for 0 through 100."""
     size = 256
@@ -614,6 +631,15 @@ class FinalmouseTray:
     def _dim_text_color(self):
         return (70, 70, 70, 255) if self.dark_text else (150, 150, 150, 255)
 
+    def _charging_bolt_color(self, frame):
+        t = (frame % 12) / 12.0
+        pulse = 0.5 + 0.5 * math.sin(2 * math.pi * t)
+        if self.dark_text:
+            shade = int(25 + 100 * pulse)
+        else:
+            shade = int(150 + 105 * pulse)
+        return (shade, shade, shade, 255)
+
     def _migrate_charge_log(self):
         changed = False
         if self.charge_log.get("last_known_pct") is None:
@@ -628,6 +654,16 @@ class FinalmouseTray:
             changed = True
             log_event("Cleared pending charge without a start percent")
             pending = None
+        elif pending and pending.get("start_pct") == 0:
+            fallback_pct = self._last_completed_charge_pct()
+            if fallback_pct not in (None, 0):
+                pending["start_pct"] = fallback_pct
+                self.charge_log["last_known_pct"] = fallback_pct
+                changed = True
+                log_event(
+                    "Repaired pending charge start percent from 0% to "
+                    f"{format_pct(fallback_pct)}"
+                )
         if pending and self._pending_charge_age_seconds(pending) > MAX_PENDING_CHARGE_SECONDS:
             self.charge_log.pop("pending_charge", None)
             changed = True
@@ -861,7 +897,7 @@ class FinalmouseTray:
 
             if visible_pct is not None:
                 if connect_visible and visible_pct == 0:
-                    return f"{CHARGING_READING}:0%"
+                    return CHARGING_READING
                 return visible_reading
 
             body_text = self.driver.find_element(By.TAG_NAME, "body").text
@@ -869,7 +905,7 @@ class FinalmouseTray:
             pct = parse_percent(reading)
             if pct is not None:
                 if connect_visible and pct == 0:
-                    return f"{CHARGING_READING}:0%"
+                    return CHARGING_READING
                 return reading
             if connect_visible:
                 log_event("Xpanel shows Connect without a visible battery percent; retrying")
@@ -963,25 +999,74 @@ class FinalmouseTray:
             )
         return tip
 
+    def _stored_last_known_pct(self):
+        value = self.charge_log.get("last_known_pct")
+        return self._coerce_percent(value)
+
+    def _last_completed_charge_pct(self):
+        last_charge = self.charge_log.get("last_charge")
+        if isinstance(last_charge, dict):
+            pct = self._coerce_percent(last_charge.get("end_pct"))
+            if pct is not None:
+                return pct
+        return parse_percent(self.charge_log.get("last_charge_pct"))
+
+    def _coerce_percent(self, value):
+        try:
+            pct = int(value)
+        except (TypeError, ValueError):
+            return None
+        return pct if 0 <= pct <= 100 else None
+
+    def _charge_session_start_percent(self, start_pct=None):
+        current_pct = parse_percent(self.battery_pct)
+        stored_pct = self._stored_last_known_pct()
+        completed_pct = self._last_completed_charge_pct()
+        if start_pct == 0:
+            for pct in (current_pct, stored_pct, completed_pct):
+                if pct not in (None, 0):
+                    return pct
+        if start_pct is not None:
+            return start_pct
+        for pct in (current_pct, stored_pct, completed_pct):
+            if pct not in (None, 0):
+                return pct
+        for pct in (current_pct, stored_pct, completed_pct):
+            if pct is not None:
+                return pct
+        return None
+
     def _start_charge_session(self, start_pct=None):
-        if self.charge_log.get("pending_charge"):
+        pending = self.charge_log.get("pending_charge")
+        start_pct = self._charge_session_start_percent(start_pct)
+        if pending:
+            pending_start_pct = self._charge_session_start_percent(
+                pending.get("start_pct")
+            )
+            if pending_start_pct != pending.get("start_pct"):
+                pending["start_pct"] = pending_start_pct
+                if pending_start_pct is not None:
+                    self.charge_log["last_known_pct"] = pending_start_pct
+                    self.battery_pct = format_pct(pending_start_pct)
+                save_charge_log(self.charge_log)
+            elif pending.get("start_pct") is None and start_pct is not None:
+                pending["start_pct"] = start_pct
+                self.charge_log["last_known_pct"] = start_pct
+                self.battery_pct = format_pct(start_pct)
+                save_charge_log(self.charge_log)
             return True
         if start_pct is not None:
             self.battery_pct = format_pct(start_pct)
             self.charge_log["last_known_pct"] = start_pct
-        else:
-            start_pct = parse_percent(self.battery_pct)
-        if start_pct is None:
-            start_pct = self.charge_log.get("last_known_pct")
-        if start_pct is None:
-            log_event("Ignored charging state without a start percent; retrying battery read")
-            return False
         self.charge_log["pending_charge"] = {
             "start_pct": start_pct,
             "started_at": datetime.now().isoformat(timespec="seconds"),
         }
         save_charge_log(self.charge_log)
-        log_event(f"Charge session started from {format_pct(start_pct)}")
+        if start_pct is None:
+            log_event("Charge session started from unknown percent")
+        else:
+            log_event(f"Charge session started from {format_pct(start_pct)}")
         return True
 
     def _finish_charge_session(self, end_pct):
@@ -1050,17 +1135,10 @@ class FinalmouseTray:
     def _charging_animation(self):
         frame = 0
         while self.running and self.is_charging:
-            t = (frame % 12) / 12.0
-            brightness = int(80 + 175 * (0.5 + 0.5 * math.sin(2 * math.pi * t)))
-            color = (0, brightness, 0, 255)
-            display = self.battery_pct
-            if display == "...":
-                pending = self.charge_log.get("pending_charge") or {}
-                display = format_pct(pending.get("start_pct"))
-                if display == "unknown":
-                    display = "..."
             if self.icon:
-                self.icon.icon = create_battery_icon(display, color=color)
+                self.icon.icon = create_charging_icon(
+                    color=self._charging_bolt_color(frame)
+                )
             frame += 1
             time.sleep(CHARGING_ANIMATION_INTERVAL)
 
@@ -1080,12 +1158,14 @@ class FinalmouseTray:
         if is_charging_reading(reading):
             start_pct = charging_start_percent(reading)
             if not self.is_charging:
-                if not self._start_charge_session(start_pct):
-                    self.icon.icon = create_battery_icon(self.battery_pct, color=self._dim_text_color())
-                    self.icon.title = self._build_tooltip()
-                    return
+                self._start_charge_session(start_pct)
                 self.is_charging = True
+                self.icon.icon = create_charging_icon(
+                    color=self._charging_bolt_color(0)
+                )
                 self._start_charging_anim()
+            else:
+                self._start_charge_session(start_pct)
             self.icon.title = self._build_tooltip()
             return
 
@@ -1273,7 +1353,12 @@ class FinalmouseTray:
         self.settings["dark_text"] = self.dark_text
         save_settings(self.settings)
         if self.icon:
-            self.icon.icon = create_battery_icon(self.battery_pct, color=self._text_color())
+            if self.is_charging:
+                self.icon.icon = create_charging_icon(
+                    color=self._charging_bolt_color(0)
+                )
+            else:
+                self.icon.icon = create_battery_icon(self.battery_pct, color=self._text_color())
             self.icon.title = self._build_tooltip()
             try:
                 self.icon.update_menu()
