@@ -94,6 +94,16 @@ wscript .\finalmouse_tray_silent.vbs
 | `Dark text` | Toggles the tray icon number between white and black text |
 | `Quit` | Stops the tray app and cleans up app-owned browser processes |
 
+## Screenshots
+
+| Charging details | Charging bolt fade |
+|---|---|
+| ![Charging tray icon with charge details](assets/charging-details.png) | ![Charging tray icon showing a faded lightning bolt](assets/charging-bolt-gradient.png) |
+| Current percent | Dark text percent |
+| ![Battery percent tray icon with charge details](assets/battery-percent-details.png) | ![Dark text battery percent tray icon](assets/dark-text-percent.png) |
+| Dark text charging | |
+| ![Dark text charging lightning bolt tray icon](assets/dark-text-charging.png) | |
+
 ## Charge History
 
 The tooltip tracks completed charge sessions:
