@@ -294,16 +294,14 @@ def acquire_lock():
         try:
             with open(LOCK_FILE, "r", encoding="utf-8") as f:
                 old_pid = int(f.read().strip())
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {old_pid}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                creationflags=NO_WINDOW,
-            )
-            if str(old_pid) in result.stdout:
+            if old_pid in get_tray_process_pids(exclude_current=False):
                 return False
+            log_event(f"Removed stale tray lock for non-tray PID {old_pid}")
         except (ValueError, OSError, subprocess.SubprocessError):
+            log_event("Removed unreadable stale tray lock")
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
             pass
     if get_tray_process_pids():
         return False
