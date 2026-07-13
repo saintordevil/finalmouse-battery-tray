@@ -20,6 +20,8 @@ The app is designed for a quiet daily setup: no visible browser, no console wind
 | Watchdog recovery | Restarts the isolated browser if Chrome disappears or polling gets stale |
 | Restart safety | Uses locks, cooldowns, and restart limits to avoid Chrome restart loops |
 | Safer cleanup | Kills only Chrome processes tied to the isolated Finalmouse profile |
+| Durable state | Uses atomic JSON writes and avoids rewriting unchanged battery state |
+| Bounded logs | Rotates the runtime log at 1 MB instead of growing without limit |
 
 ## Requirements
 
@@ -28,17 +30,17 @@ The app is designed for a quiet daily setup: no visible browser, no console wind
 * Google Chrome
 * Python packages:
 
-```powershell
-pip install pystray pillow selenium
+```bat
+python -m pip install -r requirements.txt
 ```
 
 ## Install
 
 Clone the repo or download the folder, then install dependencies:
 
-```powershell
-cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
-pip install pystray pillow selenium
+```bat
+cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
+python -m pip install -r requirements.txt
 ```
 
 ## Chrome WebHID Policy
@@ -66,23 +68,23 @@ If Xpanel needs a first-time login, pairing, or permission approval:
 
 ## Usage
 
-```powershell
-cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
-.\start.bat
+```bat
+cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
+start.bat
 ```
 
 Stop the app:
 
-```powershell
-cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
-.\stop.bat
+```bat
+cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
+stop.bat
 ```
 
 For a silent launch with no console window, run:
 
-```powershell
-cd C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github
-wscript .\finalmouse_tray_silent.vbs
+```bat
+cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
+wscript finalmouse_tray_silent.vbs
 ```
 
 ## Tray Menu
@@ -131,7 +133,7 @@ Charge and settings data are stored in:
 * Automatic recovery uses a real page refresh first.
 * The hidden Xpanel tab is refreshed every 60 seconds to pick up battery changes and charging transitions.
 * A visible battery percentage takes priority over Xpanel `Connect`, except `Connect` with `0%` is treated as charging recovery without overwriting the last known battery percent.
-* `Connect` by itself is treated as a retry state, not charging.
+* `Connect` by itself is treated as a normal disconnected state. The tray preserves the last known percentage and waits for the scheduled refresh instead of restarting Chrome repeatedly.
 * If Selenium reports that Chrome is gone, the app restarts the browser.
 * A low-frequency watchdog checks that the poll thread and tracked Chrome process are still alive.
 * If Selenium holds the browser lock too long, the watchdog cleans up only the app-owned browser processes so polling can recover.
@@ -140,6 +142,23 @@ Charge and settings data are stored in:
 * Manual `Refresh` can force a restart if a normal page refresh does not recover the battery read.
 * Menu actions are serialized so refresh and reconnect cannot fight each other.
 * Cleanup verifies the isolated Chrome profile path before killing Chrome.
+* A Windows named mutex prevents simultaneous startup before state is loaded.
+* The stop helper holds that mutex throughout cleanup so another instance cannot start midway through shutdown.
+* Process discovery uses one batched snapshot instead of one PowerShell launch per Chrome PID.
+* Battery state and tray updates are serialized so an older browser sample cannot overwrite a newer one.
+* Unchanged battery percentages do not rewrite the charge log or redraw the icon.
+* Runtime JSON files are replaced atomically so an interrupted write cannot leave partial JSON.
+* Normal scheduled refreshes and expected watchdog lock contention are not written to the log.
+
+## Tests
+
+The regression suite does not launch Chrome or create a tray icon:
+
+```bat
+cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
+set "PYTHONDONTWRITEBYTECODE=1"
+python -m unittest discover -v
+```
 
 ## File Overview
 
@@ -151,6 +170,9 @@ Charge and settings data are stored in:
 | `stop_finalmouse.ps1` | Dependency-free process cleanup for tray and app-owned Chrome processes |
 | `finalmouse_tray_silent.vbs` | Starts the tray app without a console window |
 | `setup_policy.reg` | Chrome WebHID policy for Finalmouse Xpanel |
+| `requirements.txt` | Tested runtime dependency ranges |
+| `tests/` | Unit and Windows process-safety regression tests |
+| `LICENSE` | MIT license text |
 
 ## License
 
