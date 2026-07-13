@@ -1,7 +1,13 @@
 @echo off
 cd /d "%~dp0"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop_finalmouse.ps1" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop_finalmouse.ps1"
+set "stopCode=%ERRORLEVEL%"
 
-echo Finalmouse Battery Tray stopped.
+if "%stopCode%"=="0" (
+    echo Finalmouse Battery Tray stopped.
+) else (
+    echo Finalmouse Battery Tray could not be stopped safely. Exit code: %stopCode%
+)
 if "%1"=="" pause
+exit /b %stopCode%

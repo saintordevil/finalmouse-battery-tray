@@ -6,12 +6,14 @@ Reads from xpanel.finalmouse.com via a hidden Chrome instance.
 import atexit
 import ctypes
 import ctypes.wintypes
+import functools
 import json
 import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -29,9 +31,10 @@ PID_REFRESH_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 30
 WATCHDOG_STALE_SECONDS = 90
 PAGE_REFRESH_INTERVAL_SECONDS = 60
-STARTUP_SETTLE_SECONDS = 3
 REFRESH_SETTLE_SECONDS = 5
-CHARGING_ANIMATION_INTERVAL = 0.5
+REFRESH_MIN_SETTLE_SECONDS = 2
+READ_RETRY_INTERVAL_SECONDS = 1.0
+CHARGING_ANIMATION_INTERVAL = 1.0
 MIN_CHARGE_RECORD_SECONDS = 45
 MAX_PENDING_CHARGE_SECONDS = 12 * 60 * 60
 MIN_CHARGE_DELTA_PERCENT = 1
@@ -39,6 +42,8 @@ WEBDRIVER_COMMAND_TIMEOUT_SECONDS = 15
 RESTART_COOLDOWN_SECONDS = 30
 RESTART_WINDOW_SECONDS = 300
 MAX_RESTARTS_PER_WINDOW = 4
+LOG_MAX_BYTES = 1024 * 1024
+EXPECTED_STATE_LOG_INTERVAL_SECONDS = 300
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
 DATA_DIR = os.path.join(os.environ["LOCALAPPDATA"], "finalmouse-tray")
@@ -51,6 +56,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LOG_FILE = os.path.join(DATA_DIR, "tray.log")
 BROWSER_ERROR = "__browser_error__"
 CHARGING_READING = "charging"
+DISCONNECTED_READING = "disconnected"
 
 FONT_CANDIDATES = [
     "segoeuib.ttf",
@@ -61,8 +67,17 @@ FONT_CANDIDATES = [
     "calibri.ttf",
 ]
 RESAMPLE_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-SYNCHRONIZE = 0x00100000
-WAIT_TIMEOUT = 0x00000102
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+ERROR_ALREADY_EXISTS = 183
+INSTANCE_MUTEX_NAME = r"Local\FinalmouseBatteryTray"
+
+_LOG_LOCK = threading.Lock()
+_INSTANCE_MUTEX_HANDLE = None
+_INSTANCE_MUTEX_KERNEL32 = None
+
+
+class ProcessSnapshotError(RuntimeError):
+    pass
 
 
 class QuietChromeService(webdriver.ChromeService):
@@ -84,9 +99,26 @@ def load_json_file(path, fallback):
 
 
 def save_json_file(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_charge_log():
@@ -107,10 +139,18 @@ def save_settings(data):
 
 def log_event(message):
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{timestamp} {message}\n")
+        with _LOG_LOCK:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) >= LOG_MAX_BYTES:
+                backup_path = f"{LOG_FILE}.1"
+                try:
+                    os.remove(backup_path)
+                except OSError:
+                    pass
+                os.replace(LOG_FILE, backup_path)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{timestamp} {message}\n")
     except OSError:
         pass
 
@@ -121,7 +161,7 @@ def parse_percent(reading):
     text = str(reading).strip()
     if text == CHARGING_READING or text.startswith(f"{CHARGING_READING}:"):
         return None
-    match = re.search(r"\b(\d{1,3})\s*%", text)
+    match = re.search(r"(?<![\d.-])(\d{1,3})\s*%", text)
     if not match and re.fullmatch(r"\d{1,3}", text):
         match = re.match(r"(\d{1,3})", text)
     if not match:
@@ -169,6 +209,8 @@ def battery_state(reading):
         return None
     if is_charging_reading(reading):
         return "charging"
+    if reading == DISCONNECTED_READING:
+        return "disconnected"
     if parse_percent(reading) is not None:
         return "battery"
     return None
@@ -177,7 +219,10 @@ def battery_state(reading):
 def format_duration(seconds):
     if seconds is None:
         return "unknown"
-    seconds = max(0, int(seconds))
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError, OverflowError):
+        return "unknown"
     hours, remainder = divmod(seconds, 3600)
     minutes, _ = divmod(remainder, 60)
     if hours and minutes:
@@ -205,6 +250,7 @@ def short_time(value):
     return dt.strftime("%d/%m %I:%M%p").lower()
 
 
+@functools.lru_cache(maxsize=64)
 def load_font(font_size):
     for font_name in FONT_CANDIDATES:
         try:
@@ -288,45 +334,205 @@ def create_battery_icon(percent_text, color=(255, 255, 255, 255)):
     return img
 
 
-def acquire_lock():
-    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                old_pid = int(f.read().strip())
-            if old_pid in get_tray_process_pids(exclude_current=False):
-                return False
-            log_event(f"Removed stale tray lock for non-tray PID {old_pid}")
-        except (ValueError, OSError, subprocess.SubprocessError):
-            log_event("Removed unreadable stale tray lock")
-        try:
-            os.remove(LOCK_FILE)
-        except OSError:
-            pass
-    if get_tray_process_pids():
+def read_lock_identity():
+    try:
+        with open(LOCK_FILE, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+    except OSError:
+        return {}
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        return data
+    if text.isdigit():
+        return {"pid": int(text), "legacy": True}
+    return {}
+
+
+def acquire_instance_mutex():
+    global _INSTANCE_MUTEX_HANDLE, _INSTANCE_MUTEX_KERNEL32
+    if _INSTANCE_MUTEX_HANDLE:
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.LPCWSTR,
+    ]
+    kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+    kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+    ctypes.set_last_error(0)
+    handle = kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+    if not handle:
         return False
-    with open(LOCK_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    _INSTANCE_MUTEX_HANDLE = handle
+    _INSTANCE_MUTEX_KERNEL32 = kernel32
+    return True
+
+
+def release_instance_mutex():
+    global _INSTANCE_MUTEX_HANDLE, _INSTANCE_MUTEX_KERNEL32
+    if _INSTANCE_MUTEX_HANDLE and _INSTANCE_MUTEX_KERNEL32:
+        _INSTANCE_MUTEX_KERNEL32.CloseHandle(_INSTANCE_MUTEX_HANDLE)
+    _INSTANCE_MUTEX_HANDLE = None
+    _INSTANCE_MUTEX_KERNEL32 = None
+
+
+def acquire_lock():
+    if not acquire_instance_mutex():
+        return False
+    try:
+        snapshots = get_process_snapshots()
+    except ProcessSnapshotError as error:
+        log_event(f"Startup process discovery failed: {error}")
+        release_instance_mutex()
+        return False
+    if get_tray_process_pids(snapshots=snapshots):
+        release_instance_mutex()
+        return False
+    current = snapshots.get(os.getpid(), {})
+    identity = {
+        "pid": os.getpid(),
+        "creation_date": current.get("CreationDate"),
+        "script": os.path.abspath(__file__),
+    }
+    try:
+        save_json_file(LOCK_FILE, identity)
+    except OSError:
+        release_instance_mutex()
+        return False
     return True
 
 
 def release_lock():
+    identity = read_lock_identity()
     try:
-        os.remove(LOCK_FILE)
-    except OSError:
+        if int(identity.get("pid", -1)) == os.getpid():
+            os.remove(LOCK_FILE)
+    except (OSError, TypeError, ValueError):
         pass
+    release_instance_mutex()
 
 
-def normalize_for_match(value):
-    return str(value or "").replace("\\", "/").lower()
+def split_windows_command_line(command_line):
+    if not command_line:
+        return ()
+    shell32 = ctypes.windll.shell32
+    kernel32 = ctypes.windll.kernel32
+    shell32.CommandLineToArgvW.argtypes = [
+        ctypes.wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.wintypes.LPWSTR)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    argc = ctypes.c_int()
+    argv = shell32.CommandLineToArgvW(str(command_line), ctypes.byref(argc))
+    if not argv:
+        return ()
+    try:
+        return tuple(argv[index] for index in range(argc.value))
+    finally:
+        kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
 
 
-def pid_is_running(pid):
+def normalize_path_for_match(value):
+    if not value:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(value))))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def command_line_option(command_line, option_name):
+    option_name = str(option_name).lower()
+    prefix = f"{option_name}="
+    arguments = split_windows_command_line(command_line)
+    for index, argument in enumerate(arguments):
+        lowered = argument.lower()
+        if lowered.startswith(prefix):
+            return argument[len(prefix):]
+        if lowered == option_name and index + 1 < len(arguments):
+            return arguments[index + 1]
+    return None
+
+
+def command_line_has_script(command_line, script_path, allow_same_name=False):
+    expected_path = normalize_path_for_match(script_path)
+    expected_name = os.path.basename(expected_path)
+    arguments = split_windows_command_line(command_line)
+    if len(arguments) < 2:
+        return False
+    script_argument = arguments[1]
+    if (
+        os.path.isabs(script_argument)
+        and normalize_path_for_match(script_argument) == expected_path
+    ):
+        return True
+    return bool(
+        allow_same_name
+        and os.path.basename(script_argument).lower() == expected_name.lower()
+    )
+
+
+def get_process_snapshots():
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        "$names=@('chrome.exe','chromedriver.exe','python.exe','pythonw.exe'); "
+        "$items=@(Get-CimInstance Win32_Process -ErrorAction Stop | "
+        "Where-Object { $_.Name -in $names } | "
+        "Select-Object ProcessId,Name,ParentProcessId,CreationDate,CommandLine); "
+        "if ($items.Count -eq 0) { [Console]::Write('[]') } "
+        "else { $items | ConvertTo-Json -Compress }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProcessSnapshotError("Process discovery did not complete") from error
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ProcessSnapshotError(
+            f"Process discovery failed with exit code {result.returncode}"
+        )
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ProcessSnapshotError("Process discovery returned invalid JSON") from error
+    if isinstance(data, dict):
+        data = [data]
+    elif not isinstance(data, list):
+        raise ProcessSnapshotError("Process discovery returned an invalid payload")
+    snapshots = {}
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            pid = int(item.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        snapshots[pid] = item
+    return snapshots
+
+
+def get_process_creation_filetime(pid):
     try:
         pid = int(pid)
     except (TypeError, ValueError):
-        return False
-
+        return None
     kernel32 = ctypes.windll.kernel32
     kernel32.OpenProcess.argtypes = [
         ctypes.wintypes.DWORD,
@@ -334,178 +540,114 @@ def pid_is_running(pid):
         ctypes.wintypes.DWORD,
     ]
     kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
-    kernel32.WaitForSingleObject.argtypes = [
+    kernel32.GetProcessTimes.argtypes = [
         ctypes.wintypes.HANDLE,
-        ctypes.wintypes.DWORD,
+        ctypes.POINTER(ctypes.wintypes.FILETIME),
+        ctypes.POINTER(ctypes.wintypes.FILETIME),
+        ctypes.POINTER(ctypes.wintypes.FILETIME),
+        ctypes.POINTER(ctypes.wintypes.FILETIME),
     ]
-    kernel32.WaitForSingleObject.restype = ctypes.wintypes.DWORD
+    kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
     kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
     kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
-
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return False
+        return None
     try:
-        return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        created = ctypes.wintypes.FILETIME()
+        exited = ctypes.wintypes.FILETIME()
+        kernel = ctypes.wintypes.FILETIME()
+        user = ctypes.wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
     finally:
         kernel32.CloseHandle(handle)
 
 
-def get_process_info(pid):
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return "", ""
-    command = (
-        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=%d\"; "
-        "if ($p) { [Console]::WriteLine($p.Name); [Console]::WriteLine($p.CommandLine) }"
-    ) % pid
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=NO_WINDOW,
-        )
-    except Exception:
-        return "", ""
-    lines = result.stdout.splitlines()
-    name = lines[0].strip() if lines else ""
-    command_line = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
-    return name, command_line
+def capture_process_creation_times(pids):
+    identities = {}
+    for pid in pids:
+        creation_time = get_process_creation_filetime(pid)
+        if creation_time is not None:
+            identities[int(pid)] = creation_time
+    return identities
 
 
-def get_process_snapshot(pid):
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return {}
-
-    command = (
-        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=%d\"; "
-        "if ($p) { "
-        "$p | Select-Object ProcessId,Name,ParentProcessId,CreationDate,CommandLine "
-        "| ConvertTo-Json -Compress "
-        "}"
-    ) % pid
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=NO_WINDOW,
-        )
-    except Exception:
-        return {}
-
-    text = result.stdout.strip()
-    if not text:
-        return {}
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    return data if isinstance(data, dict) else {}
-
-
-def get_all_chrome_pids():
-    pids = set()
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=NO_WINDOW,
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.strip().strip('"').split('","')
-            if len(parts) >= 2 and parts[1].isdigit():
-                pids.add(int(parts[1]))
-    except Exception:
-        pass
-    return pids
-
-
-def is_owned_browser_pid(pid):
-    name, command_line = get_process_info(pid)
-    command_match = normalize_for_match(command_line)
-    profile_match = normalize_for_match(CHROME_PROFILE_DIR)
+def is_owned_browser_snapshot(snapshot):
+    profile_argument = command_line_option(
+        (snapshot or {}).get("CommandLine"),
+        "--user-data-dir",
+    )
     return (
-        name.lower() == "chrome.exe"
-        and profile_match
-        and profile_match in command_match
+        str((snapshot or {}).get("Name", "")).lower() == "chrome.exe"
+        and bool(profile_argument)
+        and normalize_path_for_match(profile_argument)
+        == normalize_path_for_match(CHROME_PROFILE_DIR)
     )
 
 
-def is_tracked_driver_pid(pid, expected_creation_date=None):
-    snapshot = get_process_snapshot(pid)
-    if str(snapshot.get("Name", "")).lower() != "chromedriver.exe":
+def is_tracked_driver_snapshot(snapshot, expected_creation_date=None):
+    if str((snapshot or {}).get("Name", "")).lower() != "chromedriver.exe":
         return False
-    if expected_creation_date is None:
-        return True
+    if not expected_creation_date:
+        return False
     return str(snapshot.get("CreationDate", "")) == str(expected_creation_date)
 
 
-def get_owned_chrome_pids():
-    return {pid for pid in get_all_chrome_pids() if is_owned_browser_pid(pid)}
+def get_owned_chrome_pids(snapshots=None):
+    snapshots = get_process_snapshots() if snapshots is None else snapshots
+    return {
+        pid
+        for pid, snapshot in snapshots.items()
+        if is_owned_browser_snapshot(snapshot)
+    }
 
 
 def taskkill_pid(pid):
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["taskkill", "/f", "/pid", str(int(pid))],
             capture_output=True,
             timeout=3,
             creationflags=NO_WINDOW,
         )
-    except Exception:
-        pass
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return False
 
 
-def get_tray_process_pids(exclude_current=True):
-    command = (
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { "
-        "$_.Name -in @('python.exe','pythonw.exe') -and "
-        "$_.CommandLine -match 'finalmouse_tray\\.py' "
-        "} | ForEach-Object { $_.ProcessId }"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            creationflags=NO_WINDOW,
-        )
-    except Exception:
-        return set()
-
+def get_tray_process_pids(exclude_current=True, snapshots=None):
+    snapshots = get_process_snapshots() if snapshots is None else snapshots
     current_pid = os.getpid()
+    lock_identity = read_lock_identity()
+    try:
+        locked_pid = int(lock_identity.get("pid"))
+    except (TypeError, ValueError):
+        locked_pid = None
+    expected_script = os.path.abspath(__file__)
     pids = set()
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if not line.isdigit():
+    for pid, snapshot in snapshots.items():
+        name = str(snapshot.get("Name", "")).lower()
+        if name not in {"python.exe", "pythonw.exe"}:
             continue
-        pid = int(line)
+        command_line = snapshot.get("CommandLine")
+        if not command_line_has_script(
+            command_line,
+            expected_script,
+            allow_same_name=pid == locked_pid,
+        ):
+            continue
         if exclude_current and pid == current_pid:
             continue
         pids.add(pid)
     return pids
-
-
-def cleanup_tray_processes():
-    for pid in get_tray_process_pids():
-        taskkill_pid(pid)
-    try:
-        os.remove(LOCK_FILE)
-    except OSError:
-        pass
 
 
 def load_pid_entries():
@@ -539,8 +681,9 @@ def load_pid_entries():
     return entries
 
 
-def build_pid_entry(pid, role):
-    snapshot = get_process_snapshot(pid)
+def build_pid_entry(pid, role, snapshots=None):
+    snapshots = get_process_snapshots() if snapshots is None else snapshots
+    snapshot = snapshots.get(int(pid), {})
     return {
         "pid": int(pid),
         "role": role,
@@ -549,26 +692,59 @@ def build_pid_entry(pid, role):
 
 
 def cleanup_tracked_processes():
-    for entry in load_pid_entries():
+    try:
+        snapshots = get_process_snapshots()
+    except ProcessSnapshotError as error:
+        log_event(f"Browser cleanup could not inspect processes: {error}")
+        return False
+    entries = load_pid_entries()
+    attempted_pids = set()
+    for entry in entries:
         try:
             pid = int(entry.get("pid"))
         except (TypeError, ValueError):
             continue
         role = entry.get("role")
-        if role in {"browser", "legacy"} and is_owned_browser_pid(pid):
+        snapshot = snapshots.get(pid, {})
+        if role in {"browser", "legacy"} and is_owned_browser_snapshot(snapshot):
             taskkill_pid(pid)
-        elif role == "driver" and is_tracked_driver_pid(
-            pid,
+            attempted_pids.add(pid)
+        elif role == "driver" and is_tracked_driver_snapshot(
+            snapshot,
             entry.get("creation_date"),
         ):
             taskkill_pid(pid)
+            attempted_pids.add(pid)
+
+    for pid in get_owned_chrome_pids(snapshots):
+        if pid not in attempted_pids:
+            taskkill_pid(pid)
+
+    try:
+        remaining_snapshots = get_process_snapshots()
+    except ProcessSnapshotError as error:
+        log_event(f"Browser cleanup could not verify process exit: {error}")
+        return False
+    remaining_browser_pids = get_owned_chrome_pids(remaining_snapshots)
+    remaining_driver_pids = {
+        int(entry["pid"])
+        for entry in entries
+        if (
+            str(entry.get("pid", "")).isdigit()
+            and entry.get("role") == "driver"
+            and is_tracked_driver_snapshot(
+                remaining_snapshots.get(int(entry["pid"]), {}),
+                entry.get("creation_date"),
+            )
+        )
+    }
+    if remaining_browser_pids or remaining_driver_pids:
+        return False
     try:
         os.remove(PID_FILE)
     except OSError:
         pass
-
-    for pid in get_owned_chrome_pids():
-        taskkill_pid(pid)
+    return True
 
 
 def hide_windows_by_pid(pids):
@@ -600,21 +776,33 @@ class FinalmouseTray:
         self.icon = None
         self.chrome_pids = set()
         self.browser_pids = set()
+        self.browser_creation_times = {}
         self.driver_pid = None
+        self.driver_creation_date = None
+        self.driver_creation_filetime = None
         self.is_charging = False
         self.charge_anim_thread = None
+        self.charge_anim_stop = threading.Event()
         self.hider_thread = None
         self.poll_thread = None
         self.watchdog_thread = None
+        self.action_threads = set()
+        self.action_threads_lock = threading.Lock()
         self.browser_lock = threading.RLock()
+        self.state_lock = threading.RLock()
         self.action_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self._display_key = None
+        self._last_tooltip = None
+        self._charging_frames = {}
         self.last_restart_attempt = 0
         self.restart_attempts = []
         now = time.monotonic()
         self.last_poll_heartbeat = now
-        self.last_successful_read_at = 0
         self.last_page_refresh_at = 0
         self.last_forced_cleanup_at = 0
+        self.last_connect_without_percent_log_at = 0
+        self.cleanup_complete = False
         self.charge_log = load_charge_log()
         self._migrate_charge_log()
         self.settings = load_settings()
@@ -647,12 +835,25 @@ class FinalmouseTray:
                 changed = True
 
         pending = self.charge_log.get("pending_charge")
-        if pending and pending.get("start_pct") is None:
+        if pending is not None and not isinstance(pending, dict):
+            self.charge_log.pop("pending_charge", None)
+            changed = True
+            log_event("Cleared malformed pending charge data")
+            pending = None
+        if pending is not None:
+            normalized_start = self._coerce_percent(pending.get("start_pct"))
+        else:
+            normalized_start = None
+        if pending is not None and normalized_start is None:
             self.charge_log.pop("pending_charge", None)
             changed = True
             log_event("Cleared pending charge without a start percent")
             pending = None
-        elif pending and pending.get("start_pct") == 0:
+        elif pending is not None:
+            if pending.get("start_pct") != normalized_start:
+                pending["start_pct"] = normalized_start
+                changed = True
+        if pending is not None and normalized_start == 0:
             fallback_pct = self._last_completed_charge_pct()
             if fallback_pct not in (None, 0):
                 pending["start_pct"] = fallback_pct
@@ -662,9 +863,33 @@ class FinalmouseTray:
                     "Repaired pending charge start percent from 0% to "
                     f"{format_pct(fallback_pct)}"
                 )
-        if pending and self._pending_charge_age_seconds(pending) > MAX_PENDING_CHARGE_SECONDS:
+        if (
+            pending is not None
+            and self._pending_charge_age_seconds(pending) > MAX_PENDING_CHARGE_SECONDS
+        ):
             self.charge_log.pop("pending_charge", None)
             changed = True
+
+        last_charge = self.charge_log.get("last_charge")
+        if last_charge is not None and not isinstance(last_charge, dict):
+            self.charge_log.pop("last_charge", None)
+            changed = True
+            log_event("Cleared malformed completed charge data")
+        elif last_charge is not None:
+            for field in ("start_pct", "end_pct"):
+                normalized_pct = self._coerce_percent(last_charge.get(field))
+                if last_charge.get(field) != normalized_pct:
+                    last_charge[field] = normalized_pct
+                    changed = True
+            duration = last_charge.get("duration_seconds")
+            try:
+                normalized_duration = max(0, int(duration))
+            except (TypeError, ValueError, OverflowError):
+                normalized_duration = None
+            if duration != normalized_duration:
+                last_charge["duration_seconds"] = normalized_duration
+                changed = True
+                log_event("Repaired malformed completed charge duration")
 
         if changed:
             save_charge_log(self.charge_log)
@@ -673,10 +898,22 @@ class FinalmouseTray:
         started_at = parse_iso_datetime((pending or {}).get("started_at"))
         if not started_at:
             return MAX_PENDING_CHARGE_SECONDS + 1
-        return max(0, int((datetime.now() - started_at).total_seconds()))
+        now = datetime.now(started_at.tzinfo) if started_at.tzinfo else datetime.now()
+        return max(0, int((now - started_at).total_seconds()))
 
     def _cleanup_previous(self):
-        cleanup_tracked_processes()
+        if not cleanup_tracked_processes():
+            log_event("Previous tracked browser processes did not exit")
+            return False
+
+        try:
+            owned_chrome_pids = get_owned_chrome_pids()
+        except ProcessSnapshotError as error:
+            log_event(f"Could not verify previous browser cleanup: {error}")
+            return False
+        if owned_chrome_pids:
+            log_event("Previous app-owned Chrome processes did not exit")
+            return False
 
         for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
             try:
@@ -685,38 +922,64 @@ class FinalmouseTray:
                     os.remove(lock_path)
             except OSError:
                 pass
+        return True
 
-    def _save_pids(self):
+    def _save_pids(self, snapshots=None):
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            entries = [
-                build_pid_entry(pid, "browser")
-                for pid in sorted(self.browser_pids)
-            ]
-            if self.driver_pid:
-                entries.append(build_pid_entry(self.driver_pid, "driver"))
-            with open(PID_FILE, "w", encoding="utf-8") as f:
-                json.dump(entries, f, indent=2, sort_keys=True)
-        except OSError:
+            snapshots = get_process_snapshots() if snapshots is None else snapshots
+            entries = []
+            for pid in sorted(self.browser_pids):
+                snapshot = snapshots.get(pid, {})
+                if is_owned_browser_snapshot(snapshot):
+                    entries.append(build_pid_entry(pid, "browser", snapshots))
+            driver_snapshot = snapshots.get(self.driver_pid, {})
+            if self.driver_pid and is_tracked_driver_snapshot(
+                driver_snapshot,
+                self.driver_creation_date,
+            ):
+                entries.append(build_pid_entry(self.driver_pid, "driver", snapshots))
+            if entries != load_pid_entries():
+                save_json_file(PID_FILE, entries)
+        except (OSError, ProcessSnapshotError):
             pass
 
     def _track_browser_pids(self):
-        self.browser_pids = get_owned_chrome_pids()
-        self.chrome_pids = set(self.browser_pids)
+        previous_driver_pid = self.driver_pid
+        previous_driver_creation_date = self.driver_creation_date
         try:
             service_pid = self.driver.service.process.pid
         except Exception:
             service_pid = None
+        snapshots = get_process_snapshots()
+        self.browser_pids = get_owned_chrome_pids(snapshots)
+        self.browser_creation_times = capture_process_creation_times(self.browser_pids)
+        self.chrome_pids = set(self.browser_pids)
         self.driver_pid = service_pid
+        observed_creation_date = snapshots.get(service_pid, {}).get("CreationDate")
+        if observed_creation_date:
+            self.driver_creation_date = observed_creation_date
+        elif service_pid == previous_driver_pid:
+            self.driver_creation_date = previous_driver_creation_date
+        else:
+            self.driver_creation_date = None
         if service_pid:
             self.chrome_pids.add(service_pid)
-        self._save_pids()
+        self.driver_creation_filetime = get_process_creation_filetime(service_pid)
+        self._save_pids(snapshots)
         hide_windows_by_pid(self.chrome_pids)
 
     def _has_live_browser_process(self):
         self.browser_pids = {
             pid for pid in self.browser_pids
-            if pid_is_running(pid)
+            if (
+                pid in self.browser_creation_times
+                and get_process_creation_filetime(pid)
+                == self.browser_creation_times[pid]
+            )
+        }
+        self.browser_creation_times = {
+            pid: self.browser_creation_times[pid]
+            for pid in self.browser_pids
         }
         if self.browser_pids:
             return True
@@ -724,17 +987,29 @@ class FinalmouseTray:
         if not self.driver:
             return False
 
-        self.browser_pids = get_owned_chrome_pids()
+        snapshots = get_process_snapshots()
+        self.browser_pids = get_owned_chrome_pids(snapshots)
+        self.browser_creation_times = capture_process_creation_times(self.browser_pids)
         self.chrome_pids = set(self.browser_pids)
-        if self.driver_pid and pid_is_running(self.driver_pid):
+        if (
+            self.driver_pid
+            and self.driver_creation_filetime is not None
+            and get_process_creation_filetime(self.driver_pid)
+            == self.driver_creation_filetime
+        ):
             self.chrome_pids.add(self.driver_pid)
-        self._save_pids()
+        self._save_pids(snapshots)
         return bool(self.browser_pids)
 
     def start_browser(self):
+        if self.stop_event.is_set() or not self.running:
+            return False
         with self.browser_lock:
+            if self.stop_event.is_set() or not self.running:
+                return False
             os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
-            self._cleanup_previous()
+            if not self._cleanup_previous():
+                return False
             options = Options()
             options.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
             options.add_argument("--no-first-run")
@@ -753,18 +1028,28 @@ class FinalmouseTray:
                 service = QuietChromeService(log_output=subprocess.DEVNULL)
                 service.creation_flags = NO_WINDOW
                 self.driver = webdriver.Chrome(options=options, service=service)
-                self.driver.command_executor.set_timeout(
+                if self.stop_event.is_set() or not self.running:
+                    self._kill_chrome_locked()
+                    return False
+                self.driver.command_executor.client_config.timeout = (
                     WEBDRIVER_COMMAND_TIMEOUT_SECONDS
                 )
                 self.driver.set_page_load_timeout(20)
                 self.driver.set_script_timeout(10)
-                time.sleep(STARTUP_SETTLE_SECONDS)
                 self._track_browser_pids()
+                if self.stop_event.is_set() or not self.running:
+                    self._kill_chrome_locked()
+                    return False
 
                 self.driver.get(XPANEL_URL)
-                time.sleep(2)
+                if self.stop_event.is_set() or not self.running:
+                    self._kill_chrome_locked()
+                    return False
                 self.last_page_refresh_at = time.monotonic()
                 self._track_browser_pids()
+                if self.stop_event.is_set() or not self.running:
+                    self._kill_chrome_locked()
+                    return False
 
                 if not self.hider_thread or not self.hider_thread.is_alive():
                     self.hider_thread = threading.Thread(
@@ -781,56 +1066,128 @@ class FinalmouseTray:
                 return False
 
     def _persistent_hider(self):
-        last_pid_refresh = 0
-        while self.running:
-            time.sleep(HIDER_INTERVAL)
+        last_pid_refresh = time.monotonic()
+        while self.running and not self.stop_event.wait(HIDER_INTERVAL):
             try:
                 now = time.monotonic()
                 if now - last_pid_refresh >= PID_REFRESH_INTERVAL_SECONDS:
-                    self.browser_pids |= get_owned_chrome_pids()
-                    self.chrome_pids = set(self.browser_pids)
-                    if self.driver_pid and pid_is_running(self.driver_pid):
-                        self.chrome_pids.add(self.driver_pid)
-                    self._save_pids()
+                    with self.browser_lock:
+                        snapshots = get_process_snapshots()
+                        self.browser_pids = get_owned_chrome_pids(snapshots)
+                        self.browser_creation_times = capture_process_creation_times(
+                            self.browser_pids
+                        )
+                        self.chrome_pids = set(self.browser_pids)
+                        if self.driver_pid and is_tracked_driver_snapshot(
+                            snapshots.get(self.driver_pid, {}),
+                            self.driver_creation_date,
+                        ):
+                            self.chrome_pids.add(self.driver_pid)
+                        self._save_pids(snapshots)
                     last_pid_refresh = now
-                hide_windows_by_pid(self.chrome_pids)
+                with self.browser_lock:
+                    self.browser_pids = {
+                        pid for pid in self.browser_pids
+                        if (
+                            pid in self.browser_creation_times
+                            and get_process_creation_filetime(pid)
+                            == self.browser_creation_times[pid]
+                        )
+                    }
+                    self.browser_creation_times = {
+                        pid: self.browser_creation_times[pid]
+                        for pid in self.browser_pids
+                    }
+                    self.chrome_pids = set(self.browser_pids)
+                    if (
+                        self.driver_pid
+                        and self.driver_creation_filetime is not None
+                        and get_process_creation_filetime(self.driver_pid)
+                        == self.driver_creation_filetime
+                    ):
+                        self.chrome_pids.add(self.driver_pid)
+                    pids_to_hide = set(self.chrome_pids)
+                hide_windows_by_pid(pids_to_hide)
             except Exception:
                 pass
 
     def _kill_chrome_locked(self):
-        live_browser_pids = {
-            pid for pid in self.browser_pids
-            if pid_is_running(pid)
-        }
         if self.driver:
-            if live_browser_pids:
-                try:
-                    self.driver.quit()
-                except Exception:
-                    pass
-            elif self.driver_pid and is_tracked_driver_pid(self.driver_pid):
-                taskkill_pid(self.driver_pid)
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
             self.driver = None
 
-        pids_to_check = set(self.chrome_pids) | live_browser_pids | get_owned_chrome_pids()
-        for pid in pids_to_check:
-            if is_owned_browser_pid(pid) or (
-                self.driver_pid
-                and pid == self.driver_pid
-                and is_tracked_driver_pid(pid)
-            ):
-                taskkill_pid(pid)
+        try:
+            snapshots = get_process_snapshots()
+        except ProcessSnapshotError as error:
+            log_event(f"Browser cleanup inspection failed: {error}")
+            return False
+        for pid in get_owned_chrome_pids(snapshots):
+            taskkill_pid(pid)
+        if self.driver_pid and is_tracked_driver_snapshot(
+            snapshots.get(self.driver_pid, {}),
+            self.driver_creation_date,
+        ):
+            taskkill_pid(self.driver_pid)
+
+        try:
+            remaining_snapshots = get_process_snapshots()
+        except ProcessSnapshotError as error:
+            log_event(f"Browser cleanup verification failed: {error}")
+            return False
+        remaining_browser_pids = get_owned_chrome_pids(remaining_snapshots)
+        driver_still_running = bool(
+            self.driver_pid
+            and is_tracked_driver_snapshot(
+                remaining_snapshots.get(self.driver_pid, {}),
+                self.driver_creation_date,
+            )
+        )
+        if remaining_browser_pids or driver_still_running:
+            self.browser_pids = remaining_browser_pids
+            self.browser_creation_times = capture_process_creation_times(
+                remaining_browser_pids
+            )
+            self.chrome_pids = set(remaining_browser_pids)
+            if driver_still_running:
+                self.chrome_pids.add(self.driver_pid)
+                self.driver_creation_filetime = get_process_creation_filetime(
+                    self.driver_pid
+                )
+            else:
+                self.driver_pid = None
+                self.driver_creation_date = None
+                self.driver_creation_filetime = None
+            self._save_pids(remaining_snapshots)
+            log_event(
+                "Browser cleanup left tracked processes running: "
+                f"{sorted(self.chrome_pids)}"
+            )
+            return False
         try:
             os.remove(PID_FILE)
         except OSError:
             pass
         self.chrome_pids = set()
         self.browser_pids = set()
+        self.browser_creation_times = {}
         self.driver_pid = None
+        self.driver_creation_date = None
+        self.driver_creation_filetime = None
+        return True
 
     def kill_chrome(self):
+        if self.cleanup_complete:
+            return True
         with self.browser_lock:
-            self._kill_chrome_locked()
+            if self.cleanup_complete:
+                return True
+            cleaned = self._kill_chrome_locked()
+            if cleaned:
+                self.cleanup_complete = True
+            return cleaned
 
     def _restart_allowed(self, force):
         if force:
@@ -852,19 +1209,31 @@ class FinalmouseTray:
         return True
 
     def restart_browser(self, reason, force=False):
+        if self.stop_event.is_set() or not self.running:
+            return None
         with self.browser_lock:
+            if self.stop_event.is_set() or not self.running:
+                return None
             if not self._restart_allowed(force):
                 return None
             log_event(f"Restarting browser: {reason}")
             self._kill_chrome_locked()
-            if self.icon:
-                self.icon.icon = create_battery_icon("...", color=self._dim_text_color())
-                self.icon.title = "Finalmouse ULX: Reconnecting..."
+            if self.stop_event.is_set() or not self.running:
+                return None
+            with self.state_lock:
+                color = self._dim_text_color()
+                self._set_icon_image_locked(
+                    ("reconnecting", bool(self.dark_text)),
+                    lambda: create_battery_icon("...", color=color),
+                )
+                self._set_tooltip_text_locked("Finalmouse ULX: Reconnecting...")
             if not self.start_browser():
                 log_event("Browser restart failed")
                 return None
-            time.sleep(REFRESH_SETTLE_SECONDS)
-            reading = self._read_battery_locked()
+            reading = self._wait_for_battery_locked(
+                REFRESH_SETTLE_SECONDS,
+                minimum_wait_seconds=REFRESH_MIN_SETTLE_SECONDS,
+            )
             log_event(f"Browser restart reading: {reading}")
             return reading
 
@@ -906,8 +1275,19 @@ class FinalmouseTray:
                     return CHARGING_READING
                 return reading
             if connect_visible:
-                log_event("Xpanel shows Connect without a visible battery percent; retrying")
-                return None
+                now = time.monotonic()
+                last_logged = getattr(
+                    self,
+                    "last_connect_without_percent_log_at",
+                    0,
+                )
+                if now - last_logged >= EXPECTED_STATE_LOG_INTERVAL_SECONDS:
+                    log_event(
+                        "Xpanel shows Connect without a visible battery percent; "
+                        "preserving the last known percent"
+                    )
+                    self.last_connect_without_percent_log_at = now
+                return DISCONNECTED_READING
             return None
         except WebDriverException as e:
             log_event(f"Browser read failed: {e.__class__.__name__}: {str(e)[:250]}")
@@ -916,8 +1296,31 @@ class FinalmouseTray:
             log_event(f"Battery read failed unexpectedly: {e.__class__.__name__}: {str(e)[:250]}")
             return None
 
+    def _wait_for_battery_locked(self, timeout_seconds, minimum_wait_seconds=0):
+        started_at = time.monotonic()
+        deadline = started_at + max(0, timeout_seconds)
+        initial_wait = min(max(0, minimum_wait_seconds), max(0, timeout_seconds))
+        if initial_wait and self.stop_event.wait(initial_wait):
+            return None
+        reading = None
+        while self.running and not self.stop_event.is_set():
+            reading = self._read_battery_locked()
+            if reading == BROWSER_ERROR:
+                return reading
+            if battery_state(reading):
+                return reading
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.stop_event.wait(min(READ_RETRY_INTERVAL_SECONDS, remaining))
+        return reading
+
     def read_battery(self):
+        if self.stop_event.is_set() or not self.running:
+            return None
         with self.browser_lock:
+            if self.stop_event.is_set() or not self.running:
+                return None
             if not self._has_live_browser_process():
                 log_event("Browser read failed: tracked Chrome process is not running")
                 return BROWSER_ERROR
@@ -929,7 +1332,11 @@ class FinalmouseTray:
         force_restart=False,
         force_restart_on_failure=False,
     ):
+        if self.stop_event.is_set() or not self.running:
+            return None
         with self.browser_lock:
+            if self.stop_event.is_set() or not self.running:
+                return None
             if force_restart:
                 return self.restart_browser(reason, force=True)
             if not self.driver:
@@ -943,12 +1350,15 @@ class FinalmouseTray:
                     force=force_restart_on_failure,
                 )
 
-            log_event(f"Refreshing browser: {reason}")
+            if reason != "scheduled page refresh":
+                log_event(f"Refreshing browser: {reason}")
             try:
                 self.driver.refresh()
-                time.sleep(REFRESH_SETTLE_SECONDS)
                 self.last_page_refresh_at = time.monotonic()
-                reading = self._read_battery_locked()
+                reading = self._wait_for_battery_locked(
+                    REFRESH_SETTLE_SECONDS,
+                    minimum_wait_seconds=REFRESH_MIN_SETTLE_SECONDS,
+                )
             except WebDriverException as e:
                 log_event(f"Refresh failed: {e.__class__.__name__}: {str(e)[:250]}")
                 reading = BROWSER_ERROR
@@ -956,6 +1366,8 @@ class FinalmouseTray:
                 log_event(f"Refresh failed unexpectedly: {e.__class__.__name__}: {str(e)[:250]}")
                 reading = BROWSER_ERROR
 
+            if self.stop_event.is_set() or not self.running:
+                return None
             if battery_state(reading):
                 return reading
             return self.restart_browser(
@@ -976,14 +1388,14 @@ class FinalmouseTray:
             tip = f"Finalmouse ULX: {self.battery_pct}"
 
         pending = self.charge_log.get("pending_charge")
-        if pending:
+        if isinstance(pending, dict):
             tip += (
                 f"\nCharging from {format_pct(pending.get('start_pct'))}"
                 f" since {short_time(pending.get('started_at'))}"
             )
 
         last_charge = self.charge_log.get("last_charge")
-        if last_charge:
+        if isinstance(last_charge, dict):
             tip += (
                 f"\nLast charged: {short_time(last_charge.get('ended_at'))}, "
                 f"{format_pct(last_charge.get('start_pct'))} to "
@@ -1036,6 +1448,8 @@ class FinalmouseTray:
 
     def _start_charge_session(self, start_pct=None):
         pending = self.charge_log.get("pending_charge")
+        if not isinstance(pending, dict):
+            pending = None
         start_pct = self._charge_session_start_percent(start_pct)
         if pending:
             pending_start_pct = self._charge_session_start_percent(
@@ -1046,11 +1460,6 @@ class FinalmouseTray:
                 if pending_start_pct is not None:
                     self.charge_log["last_known_pct"] = pending_start_pct
                     self.battery_pct = format_pct(pending_start_pct)
-                save_charge_log(self.charge_log)
-            elif pending.get("start_pct") is None and start_pct is not None:
-                pending["start_pct"] = start_pct
-                self.charge_log["last_known_pct"] = start_pct
-                self.battery_pct = format_pct(start_pct)
                 save_charge_log(self.charge_log)
             return True
         if start_pct is not None:
@@ -1069,14 +1478,21 @@ class FinalmouseTray:
 
     def _finish_charge_session(self, end_pct):
         pending = self.charge_log.get("pending_charge")
-        if not pending:
+        if not isinstance(pending, dict):
             return
-        ended_at = datetime.now()
+        end_pct = self._coerce_percent(end_pct)
+        if end_pct is None:
+            return
         started_at = parse_iso_datetime(pending.get("started_at"))
+        ended_at = (
+            datetime.now(started_at.tzinfo)
+            if started_at and started_at.tzinfo
+            else datetime.now()
+        )
         duration = None
         if started_at:
             duration = int((ended_at - started_at).total_seconds())
-        start_pct = pending.get("start_pct")
+        start_pct = self._coerce_percent(pending.get("start_pct"))
         if duration is not None and duration > MAX_PENDING_CHARGE_SECONDS:
             self.charge_log.pop("pending_charge", None)
             save_charge_log(self.charge_log)
@@ -1130,136 +1546,187 @@ class FinalmouseTray:
             f"{format_pct(end_pct)} in {format_duration(duration)}"
         )
 
-    def _charging_animation(self):
-        frame = 0
-        while self.running and self.is_charging:
-            if self.icon:
-                self.icon.icon = create_charging_icon(
-                    color=self._charging_bolt_color(frame)
+    def _set_icon_image_locked(self, display_key, image):
+        if self.icon and display_key != self._display_key:
+            self.icon.icon = image() if callable(image) else image
+            self._display_key = display_key
+
+    def _set_tooltip_locked(self):
+        self._set_tooltip_text_locked(self._build_tooltip())
+
+    def _set_tooltip_text_locked(self, tooltip):
+        if self.icon and tooltip != self._last_tooltip:
+            self.icon.title = tooltip
+            self._last_tooltip = tooltip
+
+    def _charging_frames_locked(self):
+        theme_key = bool(self.dark_text)
+        frames = self._charging_frames.get(theme_key)
+        if frames is None:
+            frames = tuple(
+                create_charging_icon(color=self._charging_bolt_color(frame))
+                for frame in range(12)
+            )
+            self._charging_frames = {theme_key: frames}
+        return frames
+
+    def _charging_animation(self, animation_stop, frames):
+        frame = 1
+        while self.running and not self.stop_event.is_set():
+            if animation_stop.wait(CHARGING_ANIMATION_INTERVAL):
+                return
+            with self.state_lock:
+                if not self.is_charging or animation_stop.is_set():
+                    return
+                frame_index = frame % len(frames)
+                self._set_icon_image_locked(
+                    ("charging", bool(self.dark_text), frame_index),
+                    frames[frame_index],
                 )
             frame += 1
-            time.sleep(CHARGING_ANIMATION_INTERVAL)
 
     def _start_charging_anim(self):
-        if self.charge_anim_thread and self.charge_anim_thread.is_alive():
-            return
+        self.charge_anim_stop.set()
+        animation_stop = threading.Event()
+        self.charge_anim_stop = animation_stop
+        frames = self._charging_frames_locked()
         self.charge_anim_thread = threading.Thread(
             target=self._charging_animation,
+            args=(animation_stop, frames),
             daemon=True,
         )
         self.charge_anim_thread.start()
 
     def _update_icon(self, reading):
-        if not self.icon:
+        if self.stop_event.is_set() or not self.running:
             return
+        with self.state_lock:
+            if self.stop_event.is_set() or not self.running or not self.icon:
+                return
 
-        if is_charging_reading(reading):
-            start_pct = charging_start_percent(reading)
-            if not self.is_charging:
-                self._start_charge_session(start_pct)
-                self.is_charging = True
-                self.icon.icon = create_charging_icon(
-                    color=self._charging_bolt_color(0)
+            if is_charging_reading(reading):
+                start_pct = charging_start_percent(reading)
+                if not self.is_charging:
+                    self._start_charge_session(start_pct)
+                    self.is_charging = True
+                    frames = self._charging_frames_locked()
+                    self._set_icon_image_locked(
+                        ("charging", bool(self.dark_text), 0),
+                        frames[0],
+                    )
+                    self._start_charging_anim()
+                else:
+                    self._start_charge_session(start_pct)
+                self._set_tooltip_locked()
+                return
+
+            pct = parse_percent(reading)
+            if pct is None:
+                if self.is_charging:
+                    self._set_tooltip_locked()
+                    return
+                color = self._dim_text_color()
+                self._set_icon_image_locked(
+                    ("battery", self.battery_pct, color),
+                    lambda: create_battery_icon(self.battery_pct, color=color),
                 )
-                self._start_charging_anim()
-            else:
-                self._start_charge_session(start_pct)
-            self.icon.title = self._build_tooltip()
-            return
+                self._set_tooltip_locked()
+                return
 
-        if self.is_charging:
-            self.is_charging = False
-            time.sleep(0.2)
+            if self.is_charging:
+                self.is_charging = False
+                self.charge_anim_stop.set()
 
-        pct = parse_percent(reading)
-        if pct is not None:
-            if self.charge_log.get("pending_charge"):
+            if isinstance(self.charge_log.get("pending_charge"), dict):
                 self._finish_charge_session(pct)
             self.battery_pct = format_pct(pct)
-            self.charge_log["last_known_pct"] = pct
-            save_charge_log(self.charge_log)
-            self.icon.icon = create_battery_icon(self.battery_pct, color=self._text_color())
-            self.icon.title = self._build_tooltip()
-            return
-
-        self.icon.icon = create_battery_icon(self.battery_pct, color=self._dim_text_color())
-        self.icon.title = self._build_tooltip()
+            if self._stored_last_known_pct() != pct:
+                self.charge_log["last_known_pct"] = pct
+                save_charge_log(self.charge_log)
+            color = self._text_color()
+            self._set_icon_image_locked(
+                ("battery", self.battery_pct, color),
+                lambda: create_battery_icon(self.battery_pct, color=color),
+            )
+            self._set_tooltip_locked()
 
     def poll_loop(self):
-        time.sleep(POLL_INTERVAL)
+        if self.stop_event.wait(POLL_INTERVAL):
+            return
         prev_state = None
         none_count = 0
 
-        while self.running:
+        while self.running and not self.stop_event.is_set():
             self.last_poll_heartbeat = time.monotonic()
             try:
-                if self._page_refresh_due():
-                    reading = self.recover_browser("scheduled page refresh")
-                else:
-                    reading = self.read_battery()
-                if reading == BROWSER_ERROR:
-                    reading = self.restart_browser("lost Selenium browser connection")
-                    prev_state = None
+                with self.browser_lock:
+                    if self._page_refresh_due():
+                        reading = self.recover_browser("scheduled page refresh")
+                    else:
+                        reading = self.read_battery()
+                    if reading == BROWSER_ERROR:
+                        reading = self.restart_browser("lost Selenium browser connection")
+                        prev_state = None
 
-                cur_state = battery_state(reading)
-
-                if prev_state and cur_state and cur_state != prev_state:
-                    reading = self.recover_browser("battery state changed")
                     cur_state = battery_state(reading)
 
-                if cur_state is None:
-                    none_count += 1
-                    if none_count >= 3:
-                        reading = self.recover_browser("three empty battery reads")
+                    if prev_state and cur_state and cur_state != prev_state:
+                        reading = self.recover_browser("battery state changed")
                         cur_state = battery_state(reading)
-                        none_count = 0
-                else:
-                    none_count = 0
 
-                if cur_state is not None:
-                    prev_state = cur_state
-                    self.last_successful_read_at = time.monotonic()
-                self._update_icon(reading)
+                    if cur_state is None:
+                        none_count += 1
+                        if none_count >= 3:
+                            reading = self.recover_browser("three empty battery reads")
+                            cur_state = battery_state(reading)
+                            none_count = 0
+                    else:
+                        none_count = 0
+
+                    if cur_state is not None:
+                        prev_state = cur_state
+                    self._update_icon(reading)
             except Exception as e:
-                log_event(f"Poll loop recovered from error: {e.__class__.__name__}: {str(e)[:250]}")
-                try:
-                    self._update_icon(None)
-                except Exception:
-                    pass
+                log_event(
+                    "Poll loop recovered from error: "
+                    f"{e.__class__.__name__}: {str(e)[:250]}"
+                )
             finally:
                 self.last_poll_heartbeat = time.monotonic()
 
-            for _ in range(POLL_INTERVAL * 2):
-                if not self.running:
-                    break
-                time.sleep(0.5)
+            if self.stop_event.wait(POLL_INTERVAL):
+                break
 
     def _start_poll_thread(self):
+        if self.stop_event.is_set() or not self.running:
+            return
         if self.poll_thread and self.poll_thread.is_alive():
             return
         self.poll_thread = threading.Thread(target=self.poll_loop, daemon=True)
         self.poll_thread.start()
 
     def _start_watchdog_thread(self):
+        if self.stop_event.is_set() or not self.running:
+            return
         if self.watchdog_thread and self.watchdog_thread.is_alive():
             return
         self.watchdog_thread = threading.Thread(target=self.watchdog_loop, daemon=True)
         self.watchdog_thread.start()
 
     def watchdog_loop(self):
-        time.sleep(WATCHDOG_INTERVAL_SECONDS)
-        while self.running:
+        if self.stop_event.wait(WATCHDOG_INTERVAL_SECONDS):
+            return
+        while self.running and not self.stop_event.is_set():
             try:
                 self._watchdog_check()
             except Exception as e:
                 log_event(f"Watchdog recovered from error: {e.__class__.__name__}: {str(e)[:250]}")
-
-            for _ in range(WATCHDOG_INTERVAL_SECONDS * 2):
-                if not self.running:
-                    break
-                time.sleep(0.5)
+            if self.stop_event.wait(WATCHDOG_INTERVAL_SECONDS):
+                break
 
     def _watchdog_check(self):
+        if self.stop_event.is_set() or not self.running:
+            return
         if self.poll_thread and not self.poll_thread.is_alive():
             log_event("Poll thread was not running; starting a new poll thread")
             self._start_poll_thread()
@@ -1268,8 +1735,6 @@ class FinalmouseTray:
         if not self.browser_lock.acquire(blocking=False):
             if stale_for > WATCHDOG_STALE_SECONDS:
                 self._force_cleanup_stuck_browser(stale_for)
-            else:
-                log_event("Watchdog skipped because browser work is already running")
             return
 
         try:
@@ -1298,6 +1763,8 @@ class FinalmouseTray:
             self.browser_lock.release()
 
     def _force_cleanup_stuck_browser(self, stale_for):
+        if self.stop_event.is_set() or not self.running:
+            return
         now = time.monotonic()
         if now - self.last_forced_cleanup_at < RESTART_COOLDOWN_SECONDS:
             log_event(
@@ -1313,98 +1780,150 @@ class FinalmouseTray:
         cleanup_tracked_processes()
 
     def _run_menu_action(self, label, target):
-        def runner():
-            if not self.action_lock.acquire(blocking=False):
-                log_event(f"{label} skipped because another menu action is running")
-                return
-            try:
-                target()
-            finally:
-                self.action_lock.release()
+        if self.stop_event.is_set() or not self.running:
+            return
 
-        threading.Thread(target=runner, daemon=True).start()
+        def runner():
+            try:
+                if self.stop_event.is_set() or not self.running:
+                    return
+                if not self.action_lock.acquire(blocking=False):
+                    log_event(f"{label} skipped because another menu action is running")
+                    return
+                try:
+                    if not self.stop_event.is_set() and self.running:
+                        target()
+                except Exception as e:
+                    log_event(
+                        f"{label} failed: {e.__class__.__name__}: {str(e)[:250]}"
+                    )
+                finally:
+                    self.action_lock.release()
+            finally:
+                with self.action_threads_lock:
+                    self.action_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(target=runner, daemon=True)
+        with self.action_threads_lock:
+            self.action_threads.add(thread)
+        thread.start()
 
     def on_quit(self, icon, item):
-        self.running = False
-        self.is_charging = False
+        self._signal_stop()
         icon.stop()
 
     def on_refresh(self, icon, item):
         def refresh():
-            reading = self.recover_browser(
-                "manual refresh",
-                force_restart_on_failure=True,
-            )
-            self._update_icon(reading)
+            with self.browser_lock:
+                reading = self.recover_browser(
+                    "manual refresh",
+                    force_restart_on_failure=True,
+                )
+                self._update_icon(reading)
 
         self._run_menu_action("Refresh", refresh)
 
     def on_reconnect(self, icon, item):
         def reconnect():
-            reading = self.restart_browser("manual reconnect", force=True)
-            self._update_icon(reading)
+            with self.browser_lock:
+                reading = self.restart_browser("manual reconnect", force=True)
+                self._update_icon(reading)
 
         self._run_menu_action("Reconnect Browser", reconnect)
 
     def on_toggle_dark_text(self, icon, item):
-        self.dark_text = not self.dark_text
-        self.settings["dark_text"] = self.dark_text
-        save_settings(self.settings)
+        with self.state_lock:
+            self.dark_text = not self.dark_text
+            self.settings["dark_text"] = self.dark_text
+            save_settings(self.settings)
+            if self.icon:
+                if self.is_charging:
+                    frames = self._charging_frames_locked()
+                    self._set_icon_image_locked(
+                        ("charging", bool(self.dark_text), 0),
+                        frames[0],
+                    )
+                    self._start_charging_anim()
+                else:
+                    color = self._text_color()
+                    self._set_icon_image_locked(
+                        ("battery", self.battery_pct, color),
+                        lambda: create_battery_icon(self.battery_pct, color=color),
+                    )
+                self._set_tooltip_locked()
         if self.icon:
-            if self.is_charging:
-                self.icon.icon = create_charging_icon(
-                    color=self._charging_bolt_color(0)
-                )
-            else:
-                self.icon.icon = create_battery_icon(self.battery_pct, color=self._text_color())
-            self.icon.title = self._build_tooltip()
             try:
                 self.icon.update_menu()
             except Exception:
                 pass
 
+    def _signal_stop(self):
+        with self.state_lock:
+            self.running = False
+            self.is_charging = False
+            self.charge_anim_stop.set()
+            self.stop_event.set()
+
+    def _join_worker_threads(self, timeout_seconds=3):
+        deadline = time.monotonic() + timeout_seconds
+        current = threading.current_thread()
+        with self.action_threads_lock:
+            action_threads = tuple(self.action_threads)
+        for thread in (
+            self.charge_anim_thread,
+            self.hider_thread,
+            self.poll_thread,
+            self.watchdog_thread,
+            *action_threads,
+        ):
+            if not thread or thread is current or not thread.is_alive():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+
     def run(self):
-        if not acquire_lock():
-            print("Already running. Exiting.", file=sys.stderr)
-            sys.exit(0)
-        atexit.register(release_lock)
         atexit.register(self.kill_chrome)
+        try:
+            if not self.start_browser():
+                print("Could not start browser. Exiting.", file=sys.stderr)
+                sys.exit(1)
 
-        if not self.start_browser():
-            print("Could not start browser. Exiting.", file=sys.stderr)
-            release_lock()
-            sys.exit(1)
+            initial_color = self._text_color()
+            initial_icon = create_battery_icon(self.battery_pct, color=initial_color)
+            self._display_key = ("battery", self.battery_pct, initial_color)
+            menu = pystray.Menu(
+                pystray.MenuItem("Refresh", self.on_refresh),
+                pystray.MenuItem("Reconnect Browser", self.on_reconnect),
+                pystray.MenuItem(
+                    "Dark text",
+                    self.on_toggle_dark_text,
+                    checked=lambda item: self.dark_text,
+                ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit", self.on_quit),
+            )
+            self.icon = pystray.Icon(
+                "finalmouse-battery",
+                initial_icon,
+                "Finalmouse ULX: Loading...",
+                menu,
+            )
 
-        initial_icon = create_battery_icon(self.battery_pct, color=self._text_color())
-        menu = pystray.Menu(
-            pystray.MenuItem("Refresh", self.on_refresh),
-            pystray.MenuItem("Reconnect Browser", self.on_reconnect),
-            pystray.MenuItem(
-                "Dark text",
-                self.on_toggle_dark_text,
-                checked=lambda item: self.dark_text,
-            ),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self.on_quit),
-        )
-        self.icon = pystray.Icon(
-            "finalmouse-battery",
-            initial_icon,
-            "Finalmouse ULX: Loading...",
-            menu,
-        )
-
-        self._start_poll_thread()
-        self._start_watchdog_thread()
-
-        self.icon.run()
-
-        self.running = False
-        self.is_charging = False
-        self.kill_chrome()
-        release_lock()
+            self._start_poll_thread()
+            self._start_watchdog_thread()
+            self.icon.run()
+        finally:
+            self._signal_stop()
+            self.kill_chrome()
+            self._join_worker_threads()
 
 
 if __name__ == "__main__":
+    if not acquire_lock():
+        print("Already running. Exiting.", file=sys.stderr)
+        sys.exit(0)
+    atexit.register(release_lock)
     app = FinalmouseTray()
     app.run()
