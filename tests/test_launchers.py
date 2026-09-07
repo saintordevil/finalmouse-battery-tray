@@ -80,22 +80,23 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assert_record([])
 
-    def test_batch_forwards_explicit_browser_mode_only(self):
+    def test_batch_rejects_removed_browser_mode_without_launching(self):
         self.environment()
         result = self.batch("start.bat", "--browser")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_record(["--browser"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage:", result.stderr)
+        self.assertFalse(self.record.exists())
 
     def test_direct_vbs_launch_uses_its_own_folder(self):
         self.environment()
         result = subprocess.run(
             ["wscript.exe", "//B", "//nologo",
-             str(self.project / "finalmouse_tray_silent.vbs"), "--browser"],
+             str(self.project / "finalmouse_tray_silent.vbs")],
             cwd=self.caller, env=self.env, capture_output=True, text=True,
             timeout=10, creationflags=NO_WINDOW,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_record(["--browser"])
+        self.assert_record([])
 
     def test_missing_environment_is_actionable_and_does_not_launch(self):
         for invoke in (lambda: self.batch("start.bat"), self.script):
@@ -107,7 +108,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_unknown_or_extra_arguments_are_rejected_without_launch(self):
         self.environment()
-        for arguments in (("--unknown",), ("--browser", "extra"),
+        for arguments in (("--unknown",), ("--browser",), ("--browser", "extra"),
                           ('--browser & echo unexpected',), ('--browser"',)):
             with self.subTest(arguments=arguments):
                 result = self.script(*arguments)

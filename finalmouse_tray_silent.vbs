@@ -1,18 +1,13 @@
 ' Launch the project-local environment, then exit without a resident helper.
 Option Explicit
-Dim shell, files, scriptDir, pythonw, appScript, command, argument, launchError
+Dim shell, files, scriptDir, pythonw, appScript, command, launchError
 Set shell = CreateObject("WScript.Shell")
 Set files = CreateObject("Scripting.FileSystemObject")
 scriptDir = files.GetParentFolderName(WScript.ScriptFullName)
 pythonw = files.BuildPath(scriptDir, ".venv\Scripts\pythonw.exe")
 appScript = files.BuildPath(scriptDir, "finalmouse_tray.py")
 
-If WScript.Arguments.Count > 1 Then Fail "Usage: start.bat [--browser]"
-argument = ""
-If WScript.Arguments.Count = 1 Then
-    If WScript.Arguments(0) <> "--browser" Then Fail "Usage: start.bat [--browser]"
-    argument = " --browser"
-End If
+If WScript.Arguments.Count <> 0 Then Fail "Usage: start.bat (no arguments)"
 If Not files.FileExists(pythonw) Then
     Fail "Local Python environment is missing. Run " & files.BuildPath(scriptDir, "install.bat") & " first."
 End If
@@ -21,7 +16,7 @@ If Not files.FileExists(appScript) Then
 End If
 
 shell.CurrentDirectory = scriptDir
-command = Chr(34) & pythonw & Chr(34) & " " & Chr(34) & appScript & Chr(34) & argument
+command = Chr(34) & pythonw & Chr(34) & " " & Chr(34) & appScript & Chr(34)
 On Error Resume Next
 shell.Run command, 0, False
 launchError = Err.Number
