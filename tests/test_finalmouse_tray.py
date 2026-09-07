@@ -185,6 +185,8 @@ class HelperTests(unittest.TestCase):
 
 class ReadingTests(unittest.TestCase):
     def read(self, battery_texts=(), connect=False, body_text=""):
+        # This fixture bypasses the browser reader's normal constructor.
+        tray._load_browser_support()
         app = tray.FinalmouseTray.__new__(tray.FinalmouseTray)
         app.driver = FakeDriver(battery_texts, connect, body_text)
         return app._read_battery_locked()
@@ -389,6 +391,54 @@ class StateTests(unittest.TestCase):
 
 
 class LockTests(unittest.TestCase):
+    def test_venv_redirector_is_not_a_second_tray_instance(self):
+        current_pid, parent_pid = os.getpid(), os.getppid()
+        script = str(pathlib.Path(tray.__file__).resolve())
+        launcher = r'C:\Tray\.venv\Scripts\pythonw.exe'
+        snapshots = {
+            current_pid: {"ProcessId": current_pid, "ParentProcessId": parent_pid,
+                "Name": "pythonw.exe", "CommandLine": f'"C:\\Python\\pythonw.exe" "{script}"'},
+            parent_pid: {"ProcessId": parent_pid, "Name": "pythonw.exe",
+                "CommandLine": f'"{launcher}" "{script}"'},
+        }
+        with (
+            mock.patch.object(tray.sys, "prefix", r'C:\Tray\.venv'),
+            mock.patch.object(tray.sys, "base_prefix", r'C:\Python'),
+            mock.patch.object(tray.sys, "executable", launcher),
+            mock.patch.object(tray, "read_lock_identity", return_value={}),
+            mock.patch.object(tray, "get_process_creation_filetime", side_effect=lambda pid: {current_pid: 200, parent_pid: 100}.get(pid)),
+        ):
+            self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), set())
+            self.assertEqual(tray.get_tray_process_pids(exclude_current=False, snapshots=snapshots), {current_pid, parent_pid})
+            snapshots[999] = {"ProcessId": 999, "Name": "pythonw.exe", "CommandLine": f'"{launcher}" "{script}"'}
+            self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {999})
+            snapshots.pop(999)
+            snapshots[parent_pid]["CommandLine"] += ' --browser'
+            self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {parent_pid})
+            snapshots[parent_pid]["CommandLine"] = f'"C:\\Other\\pythonw.exe" "{script}"'
+            self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {parent_pid})
+
+    def test_venv_parent_exclusion_requires_verified_creation_order(self):
+        current_pid, parent_pid = os.getpid(), os.getppid()
+        script = str(pathlib.Path(tray.__file__).resolve())
+        launcher = r'C:\Tray\.venv\Scripts\pythonw.exe'
+        snapshots = {
+            current_pid: {"ProcessId": current_pid, "ParentProcessId": parent_pid,
+                "Name": "pythonw.exe", "CommandLine": f'"C:\\Python\\pythonw.exe" "{script}"'},
+            parent_pid: {"ProcessId": parent_pid, "Name": "pythonw.exe", "CommandLine": f'"{launcher}" "{script}"'},
+        }
+        with (
+            mock.patch.object(tray.sys, "prefix", r'C:\Tray\.venv'),
+            mock.patch.object(tray.sys, "base_prefix", r'C:\Python'),
+            mock.patch.object(tray.sys, "executable", launcher),
+            mock.patch.object(tray, "read_lock_identity", return_value={}),
+        ):
+            for parent_created in (None, 300):
+                with self.subTest(parent_created=parent_created), mock.patch.object(
+                    tray, "get_process_creation_filetime", side_effect=lambda pid: 200 if pid == current_pid else parent_created
+                ):
+                    self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {parent_pid})
+
     def test_lock_identity_supports_json_and_legacy_pid(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = pathlib.Path(temp_dir, "tray.lock")
@@ -585,6 +635,64 @@ class CleanupTests(unittest.TestCase):
 
 
 class BrowserLifecycleTests(unittest.TestCase):
+    def _run_hider_for(self, app, seconds, clock):
+        def wait(interval):
+            clock[0] += interval
+            return clock[0] > seconds
+
+        app.stop_event = mock.Mock()
+        app.stop_event.wait.side_effect = wait
+        with mock.patch.object(tray.time, "monotonic", side_effect=lambda: clock[0]):
+            app._persistent_hider()
+
+    def test_healthy_hider_avoids_helper_and_never_hides_reused_pids(self):
+        app = make_app()
+        app.browser_pids = {321, 322}
+        app.browser_creation_times = {321: 100, 322: 200}
+        app.chrome_pids = {321, 322, 323}
+        app.driver_pid = 323
+        app.driver_creation_filetime = 300
+        clock = [0]
+        with (
+            mock.patch.object(
+                tray, "get_process_creation_filetime",
+                side_effect=lambda pid: {321: 100, 322: 201, 323: 301}.get(pid),
+            ),
+            mock.patch.object(tray, "get_process_snapshots") as scan,
+            mock.patch.object(tray, "hide_windows_by_pid") as hide,
+        ):
+            self._run_hider_for(app, 130, clock)
+
+        scan.assert_not_called()
+        self.assertEqual(hide.call_count, 130 // tray.HIDER_INTERVAL)
+        self.assertTrue(all(call.args == ({321},) for call in hide.call_args_list))
+
+    def test_hider_rediscovers_when_cached_browser_identities_disappear(self):
+        app = make_app()
+        app.driver = object()
+        app.browser_pids = {321}
+        app.browser_creation_times = {321: 100}
+        app.chrome_pids = {321}
+        snapshot = {
+            777: {"Name": "chrome.exe", "CommandLine":
+                  f'chrome.exe --user-data-dir="{tray.CHROME_PROFILE_DIR}"'}
+        }
+        clock = [0]
+        with (
+            mock.patch.object(
+                tray, "get_process_creation_filetime",
+                side_effect=lambda pid: 900 if pid == 777 else None,
+            ),
+            mock.patch.object(tray, "get_process_snapshots", return_value=snapshot) as scan,
+            mock.patch.object(app, "_save_pids"),
+            mock.patch.object(tray, "hide_windows_by_pid") as hide,
+        ):
+            self._run_hider_for(app, 130, clock)
+
+        scan.assert_called_once()
+        self.assertEqual(hide.call_args.args, ({777},))
+        self.assertTrue(all(321 not in call.args[0] for call in hide.call_args_list))
+
     def test_cached_browser_pid_reuse_requires_an_identity_rescan(self):
         app = tray.FinalmouseTray.__new__(tray.FinalmouseTray)
         app.browser_pids = {321}
@@ -630,7 +738,10 @@ class StopScriptTests(unittest.TestCase):
     def test_start_batch_uses_an_absolute_quoted_script_path(self):
         start_path = pathlib.Path(__file__).resolve().parents[1] / "start.bat"
         content = start_path.read_text(encoding="utf-8").lower()
-        self.assertIn('pythonw "%~dp0finalmouse_tray.py"', content)
+        self.assertIn('cscript.exe //nologo "%~dp0finalmouse_tray_silent.vbs"', content)
+        launcher = start_path.with_name("finalmouse_tray_silent.vbs").read_text(encoding="utf-8").lower()
+        self.assertIn('files.buildpath(scriptdir, ".venv\\scripts\\pythonw.exe")', launcher)
+        self.assertIn('files.buildpath(scriptdir, "finalmouse_tray.py")', launcher)
 
     def test_stop_batch_preserves_cleanup_exit_code(self):
         stop_path = pathlib.Path(__file__).resolve().parents[1] / "stop.bat"
@@ -791,6 +902,224 @@ class StopScriptTests(unittest.TestCase):
                     child.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     child.kill()
+
+
+class NativeIntegrationTests(unittest.TestCase):
+    def make_native(self, charge_log=None):
+        reader = mock.Mock()
+        with (
+            mock.patch.object(tray, "load_charge_log", return_value=copy.deepcopy(charge_log or {})),
+            mock.patch.object(tray, "load_settings", return_value={}),
+            mock.patch.object(tray, "save_charge_log"),
+        ):
+            app = tray.NativeFinalmouseTray(reader=reader)
+        app.icon = FakeIcon()
+        app._start_charging_anim = mock.Mock()
+        return app, reader
+
+    def test_native_startup_does_not_load_selenium(self):
+        environment = dict(os.environ, LOCALAPPDATA=TEST_DATA_DIR)
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; import finalmouse_tray as t; "
+             "app=t.NativeFinalmouseTray(reader=object()); "
+             "assert not any(x=='selenium' or x.startswith('selenium.') for x in sys.modules)"],
+            env=environment, capture_output=True, text=True, timeout=10,
+            creationflags=tray.NO_WINDOW,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_native_status_updates_same_tray_and_charge_history(self):
+        from native_hid import BatteryReading
+        app, reader = self.make_native({"last_known_pct": 55})
+        reader.read.return_value = BatteryReading(55, False, True, 3940)
+        app._update_icon(app.read_battery())
+        self.assertEqual(app.battery_pct, "55%")
+        reader.read.return_value = BatteryReading(60, True, True, 3996)
+        app._update_icon(app.read_battery())
+        self.assertTrue(app.is_charging)
+        pending = copy.deepcopy(app.charge_log["pending_charge"])
+        self.assertEqual(pending["start_pct"], 55)
+        reader.read.return_value = BatteryReading(70, True, True, 4112)
+        app._update_icon(app.read_battery())
+        self.assertEqual(app.charge_log["pending_charge"], pending)
+        app.charge_log["pending_charge"]["started_at"] = (datetime.now() - timedelta(minutes=2)).isoformat()
+        reader.read.return_value = BatteryReading(70, False, True, 4112)
+        app._update_icon(app.read_battery())
+        self.assertFalse(app.is_charging)
+        self.assertEqual(app.charge_log["last_charge"]["start_pct"], 55)
+        self.assertEqual(app.charge_log["last_charge"]["end_pct"], 70)
+
+    def test_unknown_and_inactive_reads_do_not_finish_charge(self):
+        from native_hid import BatteryReadError, DeviceUnavailable, BatteryReading
+        app, reader = self.make_native({"last_known_pct": 55})
+        app._update_icon(tray.CHARGING_READING)
+        pending = copy.deepcopy(app.charge_log["pending_charge"])
+        for value in (DeviceUnavailable("Unavailable"), BatteryReadError("Timed out"),
+                      BatteryReading(None, False, False, None), BatteryReading(0, False, True, 0)):
+            with self.subTest(value=value):
+                reader.read.side_effect = value if isinstance(value, Exception) else None
+                reader.read.return_value = value
+                app._update_icon(app.read_battery())
+                self.assertTrue(app.is_charging)
+                self.assertEqual(app.charge_log["pending_charge"], pending)
+                self.assertEqual(app.battery_pct, "55%")
+
+    def test_affirmative_charge_is_distinct_from_link_inactivity(self):
+        from native_hid import BatteryReading
+        app, reader = self.make_native({"last_known_pct": 55})
+        reader.read.return_value = BatteryReading(None, True, False, None)
+        self.assertEqual(app.read_battery(), tray.CHARGING_READING)
+        reader.read.return_value = BatteryReading(None, False, False, None)
+        self.assertEqual(app.read_battery(), tray.DISCONNECTED_READING)
+
+    def test_wired_power_uses_charging_ui_until_a_fresh_wireless_percent(self):
+        from native_hid import BatteryReading, DeviceUnavailable
+        app, reader = self.make_native({"last_known_pct": 53})
+        reader.read.return_value = BatteryReading(None, None, True, None, power_connected=True)
+        app._update_icon(app.read_battery())
+        self.assertTrue(app.is_charging)
+        self.assertEqual(app.battery_pct, "53%")
+        pending = copy.deepcopy(app.charge_log["pending_charge"])
+        self.assertEqual(pending["start_pct"], 53)
+        reader.read.side_effect = DeviceUnavailable("ULX is unavailable")
+        app._update_icon(app.read_battery())
+        self.assertEqual(app.charge_log["pending_charge"], pending)
+        reader.read.side_effect = None
+        reader.read.return_value = BatteryReading(60, False, True, 3996)
+        app.charge_log["pending_charge"]["started_at"] = (datetime.now() - timedelta(minutes=2)).isoformat()
+        app._update_icon(app.read_battery())
+        self.assertFalse(app.is_charging)
+        self.assertEqual(app.charge_log["last_charge"]["start_pct"], 53)
+        self.assertEqual(app.charge_log["last_charge"]["end_pct"], 60)
+
+    def test_refresh_reconnect_and_shutdown_never_start_browser_helpers(self):
+        from native_hid import BatteryReading
+        app, reader = self.make_native()
+        reader.read.return_value = BatteryReading(55, False, True, 3940)
+        with mock.patch.object(app, "_cleanup_previous", return_value=True) as cleanup:
+            self.assertTrue(app.start_browser())
+        cleanup.assert_called_once_with()
+        with (
+            mock.patch.object(tray, "get_process_snapshots", side_effect=AssertionError("Native reader started process discovery")),
+            mock.patch.object(tray, "_load_browser_support", side_effect=AssertionError("Native reader loaded Selenium")),
+        ):
+            self.assertEqual(app.recover_browser("manual refresh", force_restart_on_failure=True), "55%")
+            self.assertEqual(app.restart_browser("manual reconnect", force=True), "55%")
+            app.poll_thread = mock.Mock()
+            app.poll_thread.is_alive.return_value = True
+            app._watchdog_check()
+            self.assertEqual(reader.close.call_count, 2)
+            app._signal_stop()
+            app.kill_chrome()
+            app.kill_chrome()
+            self.assertIsNone(app.read_battery())
+            self.assertEqual(reader.close.call_count, 3)
+
+    def test_native_startup_stops_if_previous_browser_cleanup_cannot_be_verified(self):
+        app, reader = self.make_native()
+        with mock.patch.object(app, "_cleanup_previous", return_value=False):
+            self.assertFalse(app.start_browser())
+        reader.read.assert_not_called()
+        app._signal_stop()
+        with mock.patch.object(app, "_cleanup_previous") as cleanup:
+            self.assertFalse(app.start_browser())
+        cleanup.assert_not_called()
+
+    def test_native_startup_removes_only_verified_previous_browser(self):
+        app, reader = self.make_native()
+        owned = {"Name": "chrome.exe", "CommandLine":
+                 f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}"'}
+        unrelated = {"Name": "chrome.exe", "CommandLine":
+                     f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}-other"'}
+        reused_driver = {"Name": "chromedriver.exe", "CreationDate": "new"}
+        entries = [{"pid": 321, "role": "browser"},
+                   {"pid": 322, "role": "legacy"},
+                   {"pid": 323, "role": "driver", "creation_date": "old"}]
+        survivors = {322: unrelated, 323: reused_driver}
+        with (
+            mock.patch.object(tray, "load_pid_entries", return_value=entries),
+            mock.patch.object(tray, "get_process_snapshots", side_effect=[
+                {321: owned, **survivors}, survivors, survivors]),
+            mock.patch.object(tray, "taskkill_pid", return_value=True) as kill,
+            mock.patch.object(tray.os, "remove"),
+        ):
+            self.assertTrue(app.start_browser())
+        kill.assert_called_once_with(321)
+        reader.read.assert_not_called()
+
+    def test_poll_applies_its_read_before_a_waiting_menu_refresh(self):
+        app, _ = self.make_native()
+        read_started = threading.Event()
+        menu_attempted = threading.Event()
+        allow_read = threading.Event()
+        applied = []
+        failures = []
+
+        def poll_read():
+            read_started.set()
+            if not allow_read.wait(2):
+                raise AssertionError("Timed out waiting to finish the poll read")
+            return "55%"
+
+        def menu_refresh():
+            menu_attempted.set()
+            try:
+                with app.browser_lock:
+                    applied.append("60%")
+            except Exception as error:
+                failures.append(error)
+
+        def apply_read(reading):
+            # Check lock ownership from another thread at the critical join.
+            # RLock can be acquired recursively by the polling thread itself.
+            acquired = []
+            def check_lock():
+                held = app.browser_lock.acquire(blocking=False)
+                acquired.append(held)
+                if held:
+                    app.browser_lock.release()
+            checker = threading.Thread(target=check_lock)
+            checker.start()
+            checker.join(2)
+            if checker.is_alive() or acquired != [False]:
+                failures.append(AssertionError("Poll released the lock before applying its sample"))
+            applied.append(reading)
+            app.stop_event.set()
+
+        with (
+            mock.patch.object(app, "read_battery", side_effect=poll_read),
+            mock.patch.object(app, "_update_icon", side_effect=apply_read),
+        ):
+            poll = threading.Thread(target=app.poll_loop)
+            menu = threading.Thread(target=menu_refresh)
+            try:
+                poll.start()
+                self.assertTrue(read_started.wait(2))
+                menu.start()
+                self.assertTrue(menu_attempted.wait(2))
+            finally:
+                allow_read.set()
+                poll.join(3)
+                if menu.ident is not None:
+                    menu.join(3)
+                app._signal_stop()
+            self.assertFalse(poll.is_alive())
+            self.assertFalse(menu.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(applied, ["55%", "60%"])
+
+    def test_native_idle_reads_do_not_redraw_or_rewrite_unchanged_state(self):
+        from native_hid import BatteryReading
+        app, reader = self.make_native({"last_known_pct": 55})
+        reader.read.return_value = BatteryReading(55, False, True, 3940)
+        app._update_icon(app.read_battery())
+        first_icon = app.icon.icon
+        with mock.patch.object(tray, "save_charge_log") as save:
+            for _ in range(12):
+                app._update_icon(app.read_battery())
+            save.assert_not_called()
+        self.assertIs(first_icon, app.icon.icon)
 
 
 if __name__ == "__main__":
