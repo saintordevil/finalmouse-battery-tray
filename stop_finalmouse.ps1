@@ -17,10 +17,7 @@ try {
     exit 2
 }
 
-$profileDir = Join-Path $DataDir "chrome-isolated"
-$normalizedProfileDir = [IO.Path]::GetFullPath($profileDir).TrimEnd("\")
 $normalizedScriptPath = [IO.Path]::GetFullPath($ScriptPath)
-$pidFile = Join-Path $DataDir "chrome.pids"
 $lockFile = Join-Path $DataDir "tray.lock"
 
 if (-not ("FinalmouseCommandLineParser" -as [type])) {
@@ -38,6 +35,51 @@ public static class FinalmouseCommandLineParser
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr LocalFree(IntPtr memory);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessTimes(IntPtr process, out long created,
+        out long exited, out long kernel, out long user);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static bool StopVerified(int pid, long expectedCreated)
+    {
+        // Query and stop through one handle so a reused PID cannot be targeted.
+        IntPtr process = OpenProcess(0x00101001, false, pid);
+        if (process == IntPtr.Zero) {
+            return Marshal.GetLastWin32Error() == 87;
+        }
+        try {
+            long created, exited, kernel, user;
+            if (!GetProcessTimes(process, out created, out exited, out kernel, out user)) {
+                return false;
+            }
+            // CIM reports creation timestamps to microsecond precision.
+            if (created / 10 != expectedCreated / 10) {
+                return true;
+            }
+            if (WaitForSingleObject(process, 0) == 0) {
+                return true;
+            }
+            if (!TerminateProcess(process, 0)) {
+                return WaitForSingleObject(process, 0) == 0;
+            }
+            return WaitForSingleObject(process, 5000) == 0;
+        }
+        finally {
+            CloseHandle(process);
+        }
+    }
 
     public static string[] Parse(string commandLine)
     {
@@ -149,39 +191,11 @@ function Test-LegacyTrayArgument {
     )
 }
 
-function Test-OwnedBrowserProcess {
-    param($Process)
-    if (-not $Process -or $Process.Name -ne "chrome.exe") {
-        return $false
-    }
-    $arguments = @(Get-CommandArguments -CommandLine $Process.CommandLine)
-    for ($index = 1; $index -lt $arguments.Count; $index++) {
-        $argument = [string] $arguments[$index]
-        $profileArgument = $null
-        if ($argument.Equals("--user-data-dir", [StringComparison]::OrdinalIgnoreCase)) {
-            if ($index + 1 -lt $arguments.Count) {
-                $profileArgument = [string] $arguments[$index + 1]
-            }
-        } elseif ($argument.StartsWith("--user-data-dir=", [StringComparison]::OrdinalIgnoreCase)) {
-            $profileArgument = $argument.Substring("--user-data-dir=".Length)
-        }
-        $candidate = Get-NormalizedPath -Value $profileArgument
-        if ($candidate -and $candidate.Equals($normalizedProfileDir, [StringComparison]::OrdinalIgnoreCase)) {
-            return $true
-        }
-    }
-    return $false
-}
-
 function Get-ProcessSnapshot {
     try {
-        $items = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $items = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop)
     } catch {
         [Console]::Error.WriteLine("Could not inspect running processes; nothing was stopped.")
-        exit 2
-    }
-    if ($items.Count -eq 0) {
-        [Console]::Error.WriteLine("Process inspection returned no results; nothing was stopped.")
         exit 2
     }
     return $items
@@ -259,15 +273,15 @@ $trayIdentities = @(
             [pscustomobject]@{
                 pid = [int] $_.ProcessId
                 creation_date = [string] $_.CreationDate
+                creation_filetime = ([DateTime] $_.CreationDate).ToUniversalTime().ToFileTimeUtc()
             }
         }
 )
-$trayPids = @($trayIdentities | Select-Object -ExpandProperty pid)
-foreach ($trayPid in $trayPids) {
-    Stop-Process -Id ([int] $trayPid) -Force
-}
-foreach ($trayPid in $trayPids) {
-    Wait-Process -Id ([int] $trayPid) -Timeout 5
+foreach ($identity in $trayIdentities) {
+    if (-not [FinalmouseCommandLineParser]::StopVerified($identity.pid, $identity.creation_filetime)) {
+        [Console]::Error.WriteLine("The verified tray process could not be stopped; tracking was preserved.")
+        exit 1
+    }
 }
 
 $processes = @(Get-ProcessSnapshot)
@@ -289,73 +303,8 @@ $traySurvivors = @(
     }
 )
 if ($traySurvivors.Count -gt 0) {
-    [Console]::Error.WriteLine("Finalmouse tray process did not stop; browser cleanup was not attempted.")
+    [Console]::Error.WriteLine("Finalmouse tray process did not stop; tracking was preserved.")
     exit 1
 }
-
-$browserPids = @(
-    $processes |
-        Where-Object { Test-OwnedBrowserProcess -Process $_ } |
-        Select-Object -ExpandProperty ProcessId -Unique
-)
-
-$driverPids = [System.Collections.Generic.HashSet[int]]::new()
-$driverEntries = @()
-if (Test-Path -LiteralPath $pidFile) {
-    try {
-        $pidEntries = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
-    } catch {
-        $pidEntries = $null
-    }
-    foreach ($entry in @($pidEntries)) {
-        if ($entry.role -ne "driver" -or [string]::IsNullOrWhiteSpace([string] $entry.creation_date)) {
-            continue
-        }
-        $process = $processes | Where-Object { [int] $_.ProcessId -eq [int] $entry.pid } | Select-Object -First 1
-        if (
-            $process -and
-            $process.Name -eq "chromedriver.exe" -and
-            (Same-CreationDate -Process $process -Expected ([string] $entry.creation_date))
-        ) {
-            [void] $driverPids.Add([int] $process.ProcessId)
-            $driverEntries += [pscustomobject]@{
-                pid = [int] $process.ProcessId
-                creation_date = [string] $entry.creation_date
-            }
-        }
-    }
-}
-
-foreach ($driverPid in $driverPids) {
-    Stop-Process -Id $driverPid -Force
-}
-foreach ($browserPid in $browserPids) {
-    Stop-Process -Id ([int] $browserPid) -Force
-}
-
-foreach ($stoppedPid in @($driverPids) + @($browserPids)) {
-    Wait-Process -Id ([int] $stoppedPid) -Timeout 5
-}
-
-$processes = @(Get-ProcessSnapshot)
-$browserSurvivors = @($processes | Where-Object { Test-OwnedBrowserProcess -Process $_ })
-$driverSurvivors = @(
-    foreach ($entry in $driverEntries) {
-        $process = $processes | Where-Object { [int] $_.ProcessId -eq $entry.pid } | Select-Object -First 1
-        if (
-            $process -and
-            $process.Name -eq "chromedriver.exe" -and
-            (Same-CreationDate -Process $process -Expected $entry.creation_date)
-        ) {
-            $process
-        }
-    }
-)
-if ($browserSurvivors.Count -gt 0 -or $driverSurvivors.Count -gt 0) {
-    [Console]::Error.WriteLine("Finalmouse browser processes did not stop; tracking files were preserved.")
-    exit 1
-}
-
-Remove-Item -LiteralPath $pidFile -Force
 Remove-Item -LiteralPath $lockFile -Force
 exit 0

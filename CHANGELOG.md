@@ -1,41 +1,42 @@
 # Changelog
 
-## 2026-09-07: Native HID monitoring and portable Windows installation
+## 2026-09-07: HID-only monitoring and updated previews
 
 ### What changed
 
-- Native HID is now the default battery reader. The percentage, pulsing bolt, text-color control, tray menu, and saved charge history remain available.
-- Wireless status is read every 10 seconds through a strictly selected ULX vendor interface. Receiver loss preserves the last percentage and retries discovery without inferring charging.
-- The distinct wired mouse interface activates the USB-power bolt when moving the cable from the receiver to the mouse. A fresh wireless reading completes the pending charge session after reconnection.
-- The previous browser reader is an explicit `--browser` fallback. Selenium is installed only through the optional dependency file. Healthy fallback operation also avoids repeated process-discovery helpers and unused address-bar WebUI pages.
-- `install.bat` selects installed 64-bit Python 3.10+, preferring 3.11, and creates or validates a local `.venv`. It does not download Python, alter global packages, or replace an incompatible environment.
-- Both launchers use the local environment and an absolute application path. Windows' Python environment redirector is identified precisely so it is not mistaken for a second tray instance. Genuine duplicates still exit.
-- The README now covers installation on other PCs, upgrades, startup shortcuts, everyday controls, and troubleshooting. Browser fallback and developer details have separate pages. Obsolete setup instructions were removed.
+- Battery monitoring now uses native HID exclusively. Removed the browser fallback, Chrome/Selenium transport, browser process tracking and recovery, optional dependency file, WebHID registry policy, and browser setup guide.
+- The controller directly manages the native receiver, polling, tray controls, animation, and saved charge history. The stop helper targets verified tray identities only and checks process creation identity through the same handle used for stopping.
+- Both launchers reject arguments for the removed mode. The app and complete regression suite use one native dependency set.
+- Replaced all five old previews with three supplied images showing the battery tooltip, charging details, and tray menu. The README displays the original images without resizing.
+- The portable installer, startup shortcut, upgrade instructions, percentage display, wired-power bolt, text-color control, and saved-history workflow remain available.
 
 ### Why
 
-A browser running continuously imposed substantial overhead on a small tray utility. Direct receiver queries preserve the display and charge tracking while removing Chrome, Xpanel, browser permissions, and network access from normal operation. Explicit wired-interface handling supports cable switching, and the installer removes machine-specific Python paths.
+The project now has one monitoring path and one dependency set. Removing the unused browser implementation simplifies maintenance and eliminates its recovery and process-discovery work. The previews show the current application.
 
 ### Measured impact
 
-The final published source and actual `start.bat` were exercised in a clean Python 3.11.9 environment on Windows 11 with an Intel i9-12900K. Selenium was absent. Values below are MiB, measured across the application's complete process tree.
+The final source started through the actual project-local launcher on Windows 11 with Python 3.11.9, Pillow 12.3.0, pystray 0.19.5, hidapi 0.15.0, and six 1.17.0. Selenium was absent. Values are MiB across the complete application process tree.
 
 | Observation | Resident working set | Private committed memory |
 |---|---:|---:|
-| Warm native use, 58.19-second CPU observation | 38.89 | 22.70 |
-| Sampled startup/run tree maximum, 74.23-second capture | 118.42 | 84.90 |
-| Tray interpreter's kernel lifetime peak | 33.05 | 22.25 |
-| Environment redirector's kernel lifetime peak | 5.96 | 1.11 |
+| Warm operation | 38.06 | 22.14 |
+| Sampled startup/run maximum, 74.05-second capture | 116.57 | 82.66 |
+| Tray interpreter's observed kernel lifetime peak | 33.17 | 21.84 |
+| Environment redirector's observed kernel lifetime peak | 5.96 | 1.12 |
 
-Warm CPU use was approximately **0.0011% of the 24-logical-processor machine**, measured from timed process CPU deltas. This is near Windows CPU-accounting resolution. Sampling used 0.1-second intervals during the first eight seconds, then one-second intervals. Temporary startup process-cleanup helpers were included; steady operation retained only the tray interpreter and the small Windows environment redirector. No browser remained.
+Warm CPU use was approximately **0.0022% of the 24-logical-processor machine**, measured from process CPU-time deltas over 58.98 seconds. This is near Windows CPU-accounting resolution. Sampling used 0.1-second intervals for the first eight seconds, then one-second intervals. Startup included one temporary process-discovery helper for duplicate protection. Steady operation retained only the tray interpreter and Windows' small Python environment redirector. Both exited after shutdown.
 
-Working set and private commit are different counters. Summed working sets can double-count shared pages. Individual kernel lifetime peaks are not simultaneous tree peaks, and sampling can miss brief tree-wide spikes. These are observations on one PC, not guaranteed resource limits.
+Working set and private commit are different counters. Summed working sets may count shared pages twice. Individual lifetime peaks are not simultaneous tree peaks, and samples can miss brief spikes. These are observations on one PC, not guaranteed ceilings.
 
 ### Validation
 
-- A clean local environment installed Pillow 12.3.0, pystray 0.19.5, hidapi 0.15.0, and six 1.17.0. Native import and 50 native/integration/launcher tests passed without Selenium.
-- **All 91 final regression tests passed**, including redirector identity, genuine duplicates, native protocol, charge-state handling, browser lifecycle, launchers, and process cleanup. Browser tests use fakes and do not launch Chrome.
-- The real tray started through the supplied launcher in the clean environment, remained active through the measured polling interval, and shut down cleanly with its redirector. A separate real duplicate launch exited while the normal installed tray remained running. Test processes were gone after cleanup.
-- Launcher tests covered spaces and shell metacharacters in paths, unrelated working directories, explicit fallback arguments, installed-runtime selection, and preservation of incompatible environments.
-- Separate physical checks on a ULX Prophecy Tfue Wireless, Small, verified cable-switch bolt behavior, return to a fresh wireless percentage, receiver-only removal without a false bolt, reconnection recovery, and history across restart. The protocol and history code remained unchanged for the final launcher check.
-- The wired bolt indicates USB power, not measured charging current or a fresh wired percentage. Charge duration includes waiting for a fresh wireless reading. Multiple mice are not correlated; duplicate matching interfaces are rejected. Separate physical sleep/off tests, every model/firmware combination, a second PC, and fresh browser login/pairing were not verified.
+- **All 83 tests passed in the clean native environment without Selenium.** Tests cover HID responses and timeouts, charging/history state, polling and menu concurrency, shutdown, duplicate-instance identity, local installation, launchers, and exact-process stopping.
+- The real tray started through `start.bat`, remained active through the measured polling interval, and exited cleanly with its redirector. A separate real duplicate launch was rejected while the normal installed tray continued running. Task-owned validation processes were gone after cleanup.
+- Saved completed-charge and pending-session data matched the restored normal tray. Source and lifecycle changes received independent review.
+- All three replacement PNGs match the user-supplied files byte for byte. The old five images are removed from the current repository.
+- Earlier physical checks verified cable-switch bolt behavior, fresh wireless percentage on return, receiver-only removal without false charging, reconnection, and history across restart on a ULX Prophecy Tfue Wireless, Small. The HID protocol and charge-history logic are unchanged in this cleanup. Separate physical sleep/off tests, every model/firmware combination, and a second PC were not verified.
+
+The wired bolt indicates USB power connection, not measured charging current or a fresh wired percentage. Charge duration includes waiting for a fresh wireless reading. Multiple mice are not correlated; duplicate matching interfaces are rejected.
+
+Earlier changes are recorded in [the native-reader and installer update](https://github.com/saintordevil/finalmouse-battery-tray/pull/2) and [the tray reliability update](https://github.com/saintordevil/finalmouse-battery-tray/pull/1).

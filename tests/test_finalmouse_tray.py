@@ -17,40 +17,10 @@ import finalmouse_tray as tray
 TEST_RUNTIME = tempfile.TemporaryDirectory()
 TEST_DATA_DIR = TEST_RUNTIME.name
 tray.DATA_DIR = TEST_DATA_DIR
-tray.CHROME_PROFILE_DIR = os.path.join(TEST_DATA_DIR, "chrome-isolated")
 tray.LOCK_FILE = os.path.join(TEST_DATA_DIR, "tray.lock")
-tray.PID_FILE = os.path.join(TEST_DATA_DIR, "chrome.pids")
 tray.CHARGE_LOG = os.path.join(TEST_DATA_DIR, "charge_log.json")
 tray.SETTINGS_FILE = os.path.join(TEST_DATA_DIR, "settings.json")
 tray.LOG_FILE = os.path.join(TEST_DATA_DIR, "tray.log")
-
-
-class FakeElement:
-    def __init__(self, text, displayed=True):
-        self.text = text
-        self._displayed = displayed
-
-    def is_displayed(self):
-        return self._displayed
-
-
-class FakeDriver:
-    def __init__(self, battery_texts=(), connect=False, body_text=""):
-        self.battery_texts = list(battery_texts)
-        self.connect = connect
-        self.body_text = body_text
-
-    def find_elements(self, by, selector):
-        if selector == ".battery-text":
-            return [FakeElement(text) for text in self.battery_texts]
-        if selector == "button" and self.connect:
-            return [FakeElement("Connect")]
-        return []
-
-    def find_element(self, by, selector):
-        if selector == "body":
-            return FakeElement(self.body_text)
-        raise AssertionError(f"Unexpected selector: {selector}")
 
 
 class FakeIcon:
@@ -87,7 +57,7 @@ def make_app(charge_log=None, settings=None):
         mock.patch.object(tray, "load_settings", return_value=copy.deepcopy(settings or {})),
         mock.patch.object(tray, "save_charge_log"),
     ):
-        app = tray.FinalmouseTray()
+        app = tray.FinalmouseTray(reader=mock.Mock())
     app.icon = FakeIcon()
     app._start_charging_anim = mock.Mock()
     return app
@@ -141,26 +111,6 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), '{"original": true}\n')
             self.assertEqual(list(pathlib.Path(temp_dir).glob("*.tmp")), [])
 
-    def test_process_identity_checks_fail_closed(self):
-        owned = {
-            "Name": "chrome.exe",
-            "CommandLine": f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}"',
-        }
-        unrelated = {
-            "Name": "chrome.exe",
-            "CommandLine": "chrome --user-data-dir=C:/Users/User/Chrome",
-        }
-        prefix_collision = {
-            "Name": "chrome.exe",
-            "CommandLine": f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}-backup"',
-        }
-        driver = {"Name": "chromedriver.exe", "CreationDate": "created"}
-        self.assertTrue(tray.is_owned_browser_snapshot(owned))
-        self.assertFalse(tray.is_owned_browser_snapshot(unrelated))
-        self.assertFalse(tray.is_owned_browser_snapshot(prefix_collision))
-        self.assertFalse(tray.is_tracked_driver_snapshot(driver, None))
-        self.assertTrue(tray.is_tracked_driver_snapshot(driver, "created"))
-        self.assertFalse(tray.is_tracked_driver_snapshot(driver, "different"))
 
     def test_process_discovery_failure_is_not_an_empty_success(self):
         failed = subprocess.CompletedProcess(
@@ -181,61 +131,6 @@ class HelperTests(unittest.TestCase):
         self.assertIsInstance(first, int)
         self.assertGreater(first, 0)
         self.assertEqual(first, second)
-
-
-class ReadingTests(unittest.TestCase):
-    def read(self, battery_texts=(), connect=False, body_text=""):
-        # This fixture bypasses the browser reader's normal constructor.
-        tray._load_browser_support()
-        app = tray.FinalmouseTray.__new__(tray.FinalmouseTray)
-        app.driver = FakeDriver(battery_texts, connect, body_text)
-        return app._read_battery_locked()
-
-    def test_xpanel_reading_matrix(self):
-        cases = [
-            (("62%",), True, "", "62%"),
-            (("0%",), True, "", tray.CHARGING_READING),
-            (("100%",), False, "", "100%"),
-            (("43%",), False, "", "43%"),
-            ((), True, "", tray.DISCONNECTED_READING),
-            ((), True, "Battery 0%", tray.CHARGING_READING),
-            ((), False, "Battery 17%", "17%"),
-        ]
-        for battery_texts, connect, body_text, expected in cases:
-            with self.subTest(
-                battery_texts=battery_texts,
-                connect=connect,
-                body_text=body_text,
-            ):
-                self.assertEqual(
-                    self.read(battery_texts, connect, body_text),
-                    expected,
-                )
-
-    def test_refresh_settle_waits_before_one_ready_dom_read(self):
-        clock = [100.0]
-        app = tray.FinalmouseTray.__new__(tray.FinalmouseTray)
-        app.running = True
-        app.stop_event = FakeStopEvent(clock)
-        app._read_battery_locked = mock.Mock(return_value="62%")
-        with mock.patch.object(tray.time, "monotonic", side_effect=lambda: clock[0]):
-            reading = app._wait_for_battery_locked(5, minimum_wait_seconds=2)
-
-        self.assertEqual(reading, "62%")
-        self.assertEqual(app.stop_event.waits, [2])
-        app._read_battery_locked.assert_called_once()
-
-    def test_refresh_settle_stops_without_reading(self):
-        clock = [100.0]
-        app = tray.FinalmouseTray.__new__(tray.FinalmouseTray)
-        app.running = True
-        app.stop_event = FakeStopEvent(clock, stop_on_wait=True)
-        app._read_battery_locked = mock.Mock(return_value="62%")
-        with mock.patch.object(tray.time, "monotonic", side_effect=lambda: clock[0]):
-            reading = app._wait_for_battery_locked(5, minimum_wait_seconds=2)
-
-        self.assertIsNone(reading)
-        app._read_battery_locked.assert_not_called()
 
 
 class StateTests(unittest.TestCase):
@@ -338,7 +233,7 @@ class StateTests(unittest.TestCase):
             mock.patch.object(tray, "save_charge_log") as save,
             mock.patch.object(tray, "log_event"),
         ):
-            app = tray.FinalmouseTray()
+            app = tray.FinalmouseTray(reader=mock.Mock())
 
         self.assertNotIn("pending_charge", app.charge_log)
         self.assertNotIn("last_charge", app.charge_log)
@@ -364,31 +259,6 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(app.charge_log["last_charge"]["duration_seconds"])
         self.assertIn("in unknown", app._build_tooltip())
 
-    def test_reconnect_ui_is_replaced_when_battery_state_is_unchanged(self):
-        app = make_app({"last_known_pct": 62})
-        app.battery_pct = "62%"
-        app._update_icon("62%")
-
-        with (
-            mock.patch.object(app, "_kill_chrome_locked", return_value=True),
-            mock.patch.object(app, "start_browser", return_value=True),
-            mock.patch.object(app, "_wait_for_battery_locked", return_value="62%"),
-        ):
-            reading = app.restart_browser("test", force=True)
-        self.assertEqual(app.icon.title, "Finalmouse ULX: Reconnecting...")
-
-        app._update_icon(reading)
-
-        self.assertEqual(app.icon.title, "Finalmouse ULX: 62%")
-        self.assertEqual(app._display_key[0], "battery")
-
-    def test_restart_is_blocked_after_shutdown_signal(self):
-        app = make_app({"last_known_pct": 62})
-        app._signal_stop()
-        with mock.patch.object(app, "start_browser") as start:
-            self.assertIsNone(app.restart_browser("late menu action", force=True))
-        start.assert_not_called()
-
 
 class LockTests(unittest.TestCase):
     def test_venv_redirector_is_not_a_second_tray_instance(self):
@@ -413,7 +283,7 @@ class LockTests(unittest.TestCase):
             snapshots[999] = {"ProcessId": 999, "Name": "pythonw.exe", "CommandLine": f'"{launcher}" "{script}"'}
             self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {999})
             snapshots.pop(999)
-            snapshots[parent_pid]["CommandLine"] += ' --browser'
+            snapshots[parent_pid]["CommandLine"] += ' --unexpected-option'
             self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {parent_pid})
             snapshots[parent_pid]["CommandLine"] = f'"C:\\Other\\pythonw.exe" "{script}"'
             self.assertEqual(tray.get_tray_process_pids(snapshots=snapshots), {parent_pid})
@@ -555,183 +425,6 @@ class LockTests(unittest.TestCase):
                 tray.release_lock()
                 self.assertFalse(path.exists())
                 release.assert_called_once()
-
-
-class CleanupTests(unittest.TestCase):
-    def test_cleanup_preserves_tracking_when_process_discovery_fails(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pid_file = pathlib.Path(temp_dir, "chrome.pids")
-            pid_file.write_text(
-                json.dumps([{"pid": 321, "role": "browser"}]),
-                encoding="utf-8",
-            )
-            with (
-                mock.patch.object(tray, "PID_FILE", str(pid_file)),
-                mock.patch.object(
-                    tray,
-                    "get_process_snapshots",
-                    side_effect=tray.ProcessSnapshotError("unavailable"),
-                ),
-                mock.patch.object(tray, "taskkill_pid") as taskkill,
-            ):
-                self.assertFalse(tray.cleanup_tracked_processes())
-
-            self.assertTrue(pid_file.exists())
-            taskkill.assert_not_called()
-
-    def test_cleanup_preserves_pid_file_when_owned_browser_survives(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pid_file = pathlib.Path(temp_dir, "chrome.pids")
-            pid_file.write_text(
-                json.dumps([{"pid": 321, "role": "browser"}]),
-                encoding="utf-8",
-            )
-            owned = {
-                321: {
-                    "ProcessId": 321,
-                    "Name": "chrome.exe",
-                    "CommandLine": f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}"',
-                }
-            }
-            with (
-                mock.patch.object(tray, "PID_FILE", str(pid_file)),
-                mock.patch.object(
-                    tray,
-                    "get_process_snapshots",
-                    side_effect=[owned, owned],
-                ),
-                mock.patch.object(tray, "taskkill_pid", return_value=False),
-            ):
-                self.assertFalse(tray.cleanup_tracked_processes())
-
-            self.assertTrue(pid_file.exists())
-
-    def test_cleanup_removes_pid_file_after_owned_processes_exit(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pid_file = pathlib.Path(temp_dir, "chrome.pids")
-            pid_file.write_text(
-                json.dumps([{"pid": 321, "role": "browser"}]),
-                encoding="utf-8",
-            )
-            owned = {
-                321: {
-                    "ProcessId": 321,
-                    "Name": "chrome.exe",
-                    "CommandLine": f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}"',
-                }
-            }
-            with (
-                mock.patch.object(tray, "PID_FILE", str(pid_file)),
-                mock.patch.object(
-                    tray,
-                    "get_process_snapshots",
-                    side_effect=[owned, {}],
-                ),
-                mock.patch.object(tray, "taskkill_pid", return_value=True),
-            ):
-                self.assertTrue(tray.cleanup_tracked_processes())
-
-            self.assertFalse(pid_file.exists())
-
-
-class BrowserLifecycleTests(unittest.TestCase):
-    def _run_hider_for(self, app, seconds, clock):
-        def wait(interval):
-            clock[0] += interval
-            return clock[0] > seconds
-
-        app.stop_event = mock.Mock()
-        app.stop_event.wait.side_effect = wait
-        with mock.patch.object(tray.time, "monotonic", side_effect=lambda: clock[0]):
-            app._persistent_hider()
-
-    def test_healthy_hider_avoids_helper_and_never_hides_reused_pids(self):
-        app = make_app()
-        app.browser_pids = {321, 322}
-        app.browser_creation_times = {321: 100, 322: 200}
-        app.chrome_pids = {321, 322, 323}
-        app.driver_pid = 323
-        app.driver_creation_filetime = 300
-        clock = [0]
-        with (
-            mock.patch.object(
-                tray, "get_process_creation_filetime",
-                side_effect=lambda pid: {321: 100, 322: 201, 323: 301}.get(pid),
-            ),
-            mock.patch.object(tray, "get_process_snapshots") as scan,
-            mock.patch.object(tray, "hide_windows_by_pid") as hide,
-        ):
-            self._run_hider_for(app, 130, clock)
-
-        scan.assert_not_called()
-        self.assertEqual(hide.call_count, 130 // tray.HIDER_INTERVAL)
-        self.assertTrue(all(call.args == ({321},) for call in hide.call_args_list))
-
-    def test_hider_rediscovers_when_cached_browser_identities_disappear(self):
-        app = make_app()
-        app.driver = object()
-        app.browser_pids = {321}
-        app.browser_creation_times = {321: 100}
-        app.chrome_pids = {321}
-        snapshot = {
-            777: {"Name": "chrome.exe", "CommandLine":
-                  f'chrome.exe --user-data-dir="{tray.CHROME_PROFILE_DIR}"'}
-        }
-        clock = [0]
-        with (
-            mock.patch.object(
-                tray, "get_process_creation_filetime",
-                side_effect=lambda pid: 900 if pid == 777 else None,
-            ),
-            mock.patch.object(tray, "get_process_snapshots", return_value=snapshot) as scan,
-            mock.patch.object(app, "_save_pids"),
-            mock.patch.object(tray, "hide_windows_by_pid") as hide,
-        ):
-            self._run_hider_for(app, 130, clock)
-
-        scan.assert_called_once()
-        self.assertEqual(hide.call_args.args, ({777},))
-        self.assertTrue(all(321 not in call.args[0] for call in hide.call_args_list))
-
-    def test_cached_browser_pid_reuse_requires_an_identity_rescan(self):
-        app = tray.FinalmouseTray.__new__(tray.FinalmouseTray)
-        app.browser_pids = {321}
-        app.browser_creation_times = {321: 100}
-        app.chrome_pids = {321}
-        app.driver = object()
-        app.driver_pid = None
-        app.driver_creation_filetime = None
-        with (
-            mock.patch.object(tray, "get_process_creation_filetime", return_value=200),
-            mock.patch.object(tray, "get_process_snapshots", return_value={}) as scan,
-            mock.patch.object(app, "_save_pids"),
-        ):
-            self.assertFalse(app._has_live_browser_process())
-
-        scan.assert_called_once()
-        self.assertEqual(app.browser_pids, set())
-
-    def test_browser_start_aborts_if_shutdown_arrives_during_constructor(self):
-        app = make_app({"last_known_pct": 62})
-        fake_driver = mock.Mock()
-
-        def construct(*args, **kwargs):
-            app._signal_stop()
-            return fake_driver
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with (
-                mock.patch.object(app, "_cleanup_previous", return_value=True),
-                mock.patch.object(tray.webdriver, "Chrome", side_effect=construct),
-                mock.patch.object(tray, "PID_FILE", str(pathlib.Path(temp_dir, "pids"))),
-                mock.patch.object(tray, "get_process_snapshots", return_value={}),
-                mock.patch.object(app, "_track_browser_pids") as track,
-            ):
-                self.assertFalse(app.start_browser())
-
-        fake_driver.quit.assert_called_once()
-        track.assert_not_called()
-        fake_driver.get.assert_not_called()
 
 
 class StopScriptTests(unittest.TestCase):
@@ -912,7 +605,7 @@ class NativeIntegrationTests(unittest.TestCase):
             mock.patch.object(tray, "load_settings", return_value={}),
             mock.patch.object(tray, "save_charge_log"),
         ):
-            app = tray.NativeFinalmouseTray(reader=reader)
+            app = tray.FinalmouseTray(reader=reader)
         app.icon = FakeIcon()
         app._start_charging_anim = mock.Mock()
         return app, reader
@@ -922,12 +615,147 @@ class NativeIntegrationTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-B", "-c",
              "import sys; import finalmouse_tray as t; "
-             "app=t.NativeFinalmouseTray(reader=object()); "
+             "app=t.FinalmouseTray(reader=object()); "
              "assert not any(x=='selenium' or x.startswith('selenium.') for x in sys.modules)"],
             env=environment, capture_output=True, text=True, timeout=10,
             creationflags=tray.NO_WINDOW,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_controller_constructs_only_the_native_reader(self):
+        with (
+            mock.patch.object(tray, "NativeBatteryReader") as factory,
+            mock.patch.object(tray.subprocess, "run", side_effect=AssertionError("Unexpected helper")),
+            mock.patch.object(tray, "load_charge_log", return_value={}),
+            mock.patch.object(tray, "load_settings", return_value={}),
+        ):
+            app = tray.FinalmouseTray()
+        factory.assert_called_once_with()
+        self.assertIs(app.native_reader, factory.return_value)
+        self.assertEqual(app.reconnect_label, "Reconnect Receiver")
+
+    def test_unsupported_browser_argument_exits_without_starting_or_locking(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment = dict(os.environ, LOCALAPPDATA=temp_dir)
+            result = subprocess.run(
+                [sys.executable, "-B", str(pathlib.Path(tray.__file__).resolve()), "--browser"],
+                env=environment, capture_output=True, text=True, timeout=10,
+                creationflags=tray.NO_WINDOW,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("Unsupported arguments", result.stderr)
+            self.assertFalse(pathlib.Path(temp_dir, "finalmouse-tray", "tray.lock").exists())
+            self.assertFalse(pathlib.Path(temp_dir, "finalmouse-tray", "tray.log").exists())
+
+    def test_start_refresh_reconnect_and_close_have_no_process_helpers(self):
+        from native_hid import BatteryReading
+        app, reader = self.make_native()
+        reader.read.return_value = BatteryReading(55, False, True, 3940)
+        with (
+            mock.patch.object(tray.subprocess, "run", side_effect=AssertionError("Unexpected helper")),
+            mock.patch.object(tray, "get_process_snapshots", side_effect=AssertionError("Unexpected discovery")),
+            mock.patch.object(app, "_run_menu_action", side_effect=lambda label, action: action()),
+        ):
+            self.assertTrue(app.start_reader())
+            reader.read.assert_not_called()
+            app.on_refresh(app.icon, None)
+            app.on_reconnect(app.icon, None)
+            self.assertEqual(app.battery_pct, "55%")
+            self.assertEqual(reader.close.call_count, 2)
+            app.close_reader()
+            app.close_reader()
+            self.assertEqual(reader.close.call_count, 3)
+            self.assertIsNone(app.read_battery())
+            self.assertIsNone(app.reconnect_receiver("late action"))
+            self.assertFalse(app.start_reader())
+            self.assertEqual(reader.read.call_count, 2)
+
+    def test_shutdown_blocks_new_reads_and_reconnects(self):
+        app, reader = self.make_native()
+        app._signal_stop()
+        self.assertFalse(app.start_reader())
+        self.assertIsNone(app.read_battery())
+        self.assertIsNone(app.reconnect_receiver("late action"))
+        reader.read.assert_not_called()
+        reader.close.assert_not_called()
+        app.close_reader()
+        reader.close.assert_called_once_with()
+
+    def test_reconnect_waiting_for_read_lock_rechecks_shutdown(self):
+        app, reader = self.make_native()
+        waiting = threading.Event()
+        results = []
+        original_lock = app.reader_lock
+
+        class ObservedLock:
+            def __enter__(self):
+                waiting.set()
+                return original_lock.__enter__()
+
+            def __exit__(self, *args):
+                return original_lock.__exit__(*args)
+
+        app.reader_lock = ObservedLock()
+        worker = threading.Thread(target=lambda: results.append(app.reconnect_receiver("waiting action")))
+        with original_lock:
+            worker.start()
+            try:
+                self.assertTrue(waiting.wait(2))
+            finally:
+                app._signal_stop()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, [None])
+        reader.read.assert_not_called()
+        reader.close.assert_not_called()
+
+    def test_poll_reads_immediately_then_waits_the_existing_interval(self):
+        app, _ = self.make_native()
+        app.stop_event = FakeStopEvent([0], stop_on_wait=True)
+        with (
+            mock.patch.object(app, "read_battery", return_value="62%") as read,
+            mock.patch.object(app, "_update_icon") as update,
+        ):
+            app.poll_loop()
+        read.assert_called_once_with()
+        update.assert_called_once_with("62%")
+        self.assertEqual(app.stop_event.waits, [tray.POLL_INTERVAL])
+
+    def test_watchdog_restarts_only_a_stopped_poll_worker(self):
+        app, reader = self.make_native()
+        app.poll_thread = mock.Mock()
+        with mock.patch.object(app, "_start_poll_thread") as start:
+            app.poll_thread.is_alive.return_value = True
+            app._watchdog_check()
+            start.assert_not_called()
+            app.poll_thread.is_alive.return_value = False
+            app._watchdog_check()
+            start.assert_called_once_with()
+            app._signal_stop()
+            app._watchdog_check()
+            start.assert_called_once_with()
+        reader.read.assert_not_called()
+        reader.close.assert_not_called()
+
+    def test_run_preserves_menu_and_closes_reader_after_icon_exit(self):
+        app, reader = self.make_native({"last_known_pct": 55})
+        with (
+            mock.patch.object(tray.atexit, "register"),
+            mock.patch.object(tray.pystray, "Icon") as icon,
+            mock.patch.object(app, "_start_poll_thread") as poll,
+            mock.patch.object(app, "_start_watchdog_thread") as watchdog,
+            mock.patch.object(app, "_join_worker_threads") as join,
+        ):
+            app.run()
+        menu = icon.call_args.args[3]
+        self.assertEqual([item.text for item in menu.items if item is not tray.pystray.Menu.SEPARATOR],
+                         ["Refresh", "Reconnect Receiver", "Dark text", "Quit"])
+        icon.return_value.run.assert_called_once_with()
+        poll.assert_called_once_with()
+        watchdog.assert_called_once_with()
+        join.assert_called_once_with()
+        reader.close.assert_called_once_with()
+        self.assertTrue(app.stop_event.is_set())
 
     def test_native_status_updates_same_tray_and_charge_history(self):
         from native_hid import BatteryReading
@@ -993,60 +821,6 @@ class NativeIntegrationTests(unittest.TestCase):
         self.assertEqual(app.charge_log["last_charge"]["start_pct"], 53)
         self.assertEqual(app.charge_log["last_charge"]["end_pct"], 60)
 
-    def test_refresh_reconnect_and_shutdown_never_start_browser_helpers(self):
-        from native_hid import BatteryReading
-        app, reader = self.make_native()
-        reader.read.return_value = BatteryReading(55, False, True, 3940)
-        with mock.patch.object(app, "_cleanup_previous", return_value=True) as cleanup:
-            self.assertTrue(app.start_browser())
-        cleanup.assert_called_once_with()
-        with (
-            mock.patch.object(tray, "get_process_snapshots", side_effect=AssertionError("Native reader started process discovery")),
-            mock.patch.object(tray, "_load_browser_support", side_effect=AssertionError("Native reader loaded Selenium")),
-        ):
-            self.assertEqual(app.recover_browser("manual refresh", force_restart_on_failure=True), "55%")
-            self.assertEqual(app.restart_browser("manual reconnect", force=True), "55%")
-            app.poll_thread = mock.Mock()
-            app.poll_thread.is_alive.return_value = True
-            app._watchdog_check()
-            self.assertEqual(reader.close.call_count, 2)
-            app._signal_stop()
-            app.kill_chrome()
-            app.kill_chrome()
-            self.assertIsNone(app.read_battery())
-            self.assertEqual(reader.close.call_count, 3)
-
-    def test_native_startup_stops_if_previous_browser_cleanup_cannot_be_verified(self):
-        app, reader = self.make_native()
-        with mock.patch.object(app, "_cleanup_previous", return_value=False):
-            self.assertFalse(app.start_browser())
-        reader.read.assert_not_called()
-        app._signal_stop()
-        with mock.patch.object(app, "_cleanup_previous") as cleanup:
-            self.assertFalse(app.start_browser())
-        cleanup.assert_not_called()
-
-    def test_native_startup_removes_only_verified_previous_browser(self):
-        app, reader = self.make_native()
-        owned = {"Name": "chrome.exe", "CommandLine":
-                 f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}"'}
-        unrelated = {"Name": "chrome.exe", "CommandLine":
-                     f'chrome --user-data-dir="{tray.CHROME_PROFILE_DIR}-other"'}
-        reused_driver = {"Name": "chromedriver.exe", "CreationDate": "new"}
-        entries = [{"pid": 321, "role": "browser"},
-                   {"pid": 322, "role": "legacy"},
-                   {"pid": 323, "role": "driver", "creation_date": "old"}]
-        survivors = {322: unrelated, 323: reused_driver}
-        with (
-            mock.patch.object(tray, "load_pid_entries", return_value=entries),
-            mock.patch.object(tray, "get_process_snapshots", side_effect=[
-                {321: owned, **survivors}, survivors, survivors]),
-            mock.patch.object(tray, "taskkill_pid", return_value=True) as kill,
-            mock.patch.object(tray.os, "remove"),
-        ):
-            self.assertTrue(app.start_browser())
-        kill.assert_called_once_with(321)
-        reader.read.assert_not_called()
 
     def test_poll_applies_its_read_before_a_waiting_menu_refresh(self):
         app, _ = self.make_native()
@@ -1065,7 +839,7 @@ class NativeIntegrationTests(unittest.TestCase):
         def menu_refresh():
             menu_attempted.set()
             try:
-                with app.browser_lock:
+                with app.reader_lock:
                     applied.append("60%")
             except Exception as error:
                 failures.append(error)
@@ -1075,10 +849,10 @@ class NativeIntegrationTests(unittest.TestCase):
             # RLock can be acquired recursively by the polling thread itself.
             acquired = []
             def check_lock():
-                held = app.browser_lock.acquire(blocking=False)
+                held = app.reader_lock.acquire(blocking=False)
                 acquired.append(held)
                 if held:
-                    app.browser_lock.release()
+                    app.reader_lock.release()
             checker = threading.Thread(target=check_lock)
             checker.start()
             checker.join(2)

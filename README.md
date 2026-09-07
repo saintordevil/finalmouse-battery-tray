@@ -2,7 +2,7 @@
 
 A lightweight Windows tray monitor for Finalmouse ULX battery status. It reads the receiver directly through native HID, displays the battery percentage beside your clock, and shows a pulsing bolt for charging or a wired USB power connection.
 
-**Native mode needs no Chrome, Selenium, Xpanel login, or registry changes.** It polls every 10 seconds and saves your charge history and text-color preference locally.
+**Monitoring uses native HID only.** It polls every 10 seconds and saves your charge history and text-color preference locally.
 
 ## Install
 
@@ -49,13 +49,17 @@ A pending charge session stays open through unavailable readings. Reconnect the 
 
 ## Screenshots
 
-| Charge details | Percentage |
-|---|---|
-| ![Tray bolt with charge details](assets/charging-details.png) | ![Battery percentage with charge details](assets/battery-percent-details.png) |
-| Bolt fade | Dark text |
-| ![Faded bolt animation](assets/charging-bolt-gradient.png) | ![Dark text percentage](assets/dark-text-percent.png) |
-| Dark text bolt | |
-| ![Dark text charging bolt](assets/dark-text-charging.png) | |
+Battery at 44%, with the last completed charge in the tooltip.
+
+![44% battery status and charge history](assets/battery-status.png)
+
+The bolt with active-session details and the previous charge history.
+
+![Bolt with active charge details and history](assets/charging-status.png)
+
+The tray menu: Refresh, Reconnect Receiver, Dark text, and Quit.
+
+![Finalmouse Battery Tray menu](assets/tray-menu.png)
 
 ## Troubleshooting
 
@@ -71,12 +75,9 @@ A pending charge session stays open through unavailable readings. Reconnect the 
 
 Your data folder contains `charge_log.json`, `settings.json`, and the bounded diagnostic `tray.log`. To back up history and preferences, quit the app and copy the two JSON files. Unchanged readings do not rewrite the history file or redraw the percentage icon.
 
-## Resource use and further details
-
-The published `.venv` installation settled at **38.89 MiB resident RAM** and **22.70 MiB private committed memory** in the measured Windows 11 run. It retained the tray interpreter and Windows' small Python environment launcher, with no browser. Startup briefly uses process-cleanup helpers. These are observations on one PC, not guaranteed ceilings.
+## Further details
 
 - [Release changes, measurements, and validation](CHANGELOG.md)
-- [Optional Xpanel browser fallback](docs/BROWSER_FALLBACK.md)
 - [Development and tests](docs/DEVELOPMENT.md)
 
 ## License

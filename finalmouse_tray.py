@@ -2,7 +2,6 @@
 Finalmouse ULX Battery Tray Monitor
 Displays battery percentage in the Windows system tray.
 Reads the receiver directly using Xpanel's battery protocol and conversion.
-The previous browser reader remains available with --browser.
 """
 import atexit
 import ctypes
@@ -22,38 +21,23 @@ from datetime import datetime
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-webdriver = WebDriverException = Options = By = QuietChromeService = None
+from native_hid import BatteryReadError, DeviceUnavailable, NativeBatteryReader
 
 POLL_INTERVAL = 10
-HIDER_INTERVAL = 5
-PID_REFRESH_INTERVAL_SECONDS = 60
 WATCHDOG_INTERVAL_SECONDS = 30
-WATCHDOG_STALE_SECONDS = 90
-PAGE_REFRESH_INTERVAL_SECONDS = 60
-REFRESH_SETTLE_SECONDS = 5
-REFRESH_MIN_SETTLE_SECONDS = 2
-READ_RETRY_INTERVAL_SECONDS = 1.0
 CHARGING_ANIMATION_INTERVAL = 1.0
 MIN_CHARGE_RECORD_SECONDS = 45
 MAX_PENDING_CHARGE_SECONDS = 12 * 60 * 60
 MIN_CHARGE_DELTA_PERCENT = 1
-WEBDRIVER_COMMAND_TIMEOUT_SECONDS = 15
-RESTART_COOLDOWN_SECONDS = 30
-RESTART_WINDOW_SECONDS = 300
-MAX_RESTARTS_PER_WINDOW = 4
 LOG_MAX_BYTES = 1024 * 1024
 EXPECTED_STATE_LOG_INTERVAL_SECONDS = 300
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
 DATA_DIR = os.path.join(os.environ["LOCALAPPDATA"], "finalmouse-tray")
-CHROME_PROFILE_DIR = os.path.join(DATA_DIR, "chrome-isolated")
-XPANEL_URL = "https://xpanel.finalmouse.com/overview"
 LOCK_FILE = os.path.join(DATA_DIR, "tray.lock")
-PID_FILE = os.path.join(DATA_DIR, "chrome.pids")
 CHARGE_LOG = os.path.join(DATA_DIR, "charge_log.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LOG_FILE = os.path.join(DATA_DIR, "tray.log")
-BROWSER_ERROR = "__browser_error__"
 CHARGING_READING = "charging"
 DISCONNECTED_READING = "disconnected"
 
@@ -77,25 +61,6 @@ _INSTANCE_MUTEX_KERNEL32 = None
 
 class ProcessSnapshotError(RuntimeError):
     pass
-
-
-def _load_browser_support():
-    """Keep Selenium and its dependency graph out of the native tray process."""
-    global webdriver, WebDriverException, Options, By, QuietChromeService
-    if webdriver is not None:
-        return
-    from selenium import webdriver as selenium_webdriver
-    from selenium.common.exceptions import WebDriverException as DriverError
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.webdriver.common.by import By as SeleniumBy
-
-    class ChromeService(selenium_webdriver.ChromeService):
-        def command_line_args(self):
-            return [arg for arg in super().command_line_args()
-                    if arg != "--enable-chrome-logs"]
-
-    webdriver, WebDriverException = selenium_webdriver, DriverError
-    Options, By, QuietChromeService = ChromeOptions, SeleniumBy, ChromeService
 
 
 def load_json_file(path, fallback):
@@ -165,7 +130,7 @@ def log_event(message):
 
 
 def parse_percent(reading):
-    if reading is None or reading == BROWSER_ERROR:
+    if reading is None:
         return None
     text = str(reading).strip()
     if text == CHARGING_READING or text.startswith(f"{CHARGING_READING}:"):
@@ -190,13 +155,6 @@ def format_pct(value):
         return "unknown"
 
 
-def normalize_reading(reading):
-    pct = parse_percent(reading)
-    if pct is None:
-        return reading
-    return format_pct(pct)
-
-
 def is_charging_reading(reading):
     if reading is None:
         return False
@@ -214,8 +172,6 @@ def charging_start_percent(reading):
 
 
 def battery_state(reading):
-    if reading == BROWSER_ERROR:
-        return None
     if is_charging_reading(reading):
         return "charging"
     if reading == DISCONNECTED_READING:
@@ -462,19 +418,6 @@ def normalize_path_for_match(value):
         return ""
 
 
-def command_line_option(command_line, option_name):
-    option_name = str(option_name).lower()
-    prefix = f"{option_name}="
-    arguments = split_windows_command_line(command_line)
-    for index, argument in enumerate(arguments):
-        lowered = argument.lower()
-        if lowered.startswith(prefix):
-            return argument[len(prefix):]
-        if lowered == option_name and index + 1 < len(arguments):
-            return arguments[index + 1]
-    return None
-
-
 def command_line_has_script(command_line, script_path, allow_same_name=False):
     expected_path = normalize_path_for_match(script_path)
     expected_name = os.path.basename(expected_path)
@@ -496,7 +439,7 @@ def command_line_has_script(command_line, script_path, allow_same_name=False):
 def get_process_snapshots():
     command = (
         "$ErrorActionPreference='Stop'; "
-        "$names=@('chrome.exe','chromedriver.exe','python.exe','pythonw.exe'); "
+        "$names=@('python.exe','pythonw.exe'); "
         "$items=@(Get-CimInstance Win32_Process -ErrorAction Stop | "
         "Where-Object { $_.Name -in $names } | "
         "Select-Object ProcessId,Name,ParentProcessId,CreationDate,CommandLine); "
@@ -580,58 +523,6 @@ def get_process_creation_filetime(pid):
         kernel32.CloseHandle(handle)
 
 
-def capture_process_creation_times(pids):
-    identities = {}
-    for pid in pids:
-        creation_time = get_process_creation_filetime(pid)
-        if creation_time is not None:
-            identities[int(pid)] = creation_time
-    return identities
-
-
-def is_owned_browser_snapshot(snapshot):
-    profile_argument = command_line_option(
-        (snapshot or {}).get("CommandLine"),
-        "--user-data-dir",
-    )
-    return (
-        str((snapshot or {}).get("Name", "")).lower() == "chrome.exe"
-        and bool(profile_argument)
-        and normalize_path_for_match(profile_argument)
-        == normalize_path_for_match(CHROME_PROFILE_DIR)
-    )
-
-
-def is_tracked_driver_snapshot(snapshot, expected_creation_date=None):
-    if str((snapshot or {}).get("Name", "")).lower() != "chromedriver.exe":
-        return False
-    if not expected_creation_date:
-        return False
-    return str(snapshot.get("CreationDate", "")) == str(expected_creation_date)
-
-
-def get_owned_chrome_pids(snapshots=None):
-    snapshots = get_process_snapshots() if snapshots is None else snapshots
-    return {
-        pid
-        for pid, snapshot in snapshots.items()
-        if is_owned_browser_snapshot(snapshot)
-    }
-
-
-def taskkill_pid(pid):
-    try:
-        result = subprocess.run(
-            ["taskkill", "/f", "/pid", str(int(pid))],
-            capture_output=True,
-            timeout=3,
-            creationflags=NO_WINDOW,
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-        return False
-
-
 def get_venv_launcher_pid(snapshots):
     """Identify this interpreter's Windows venv redirector, not another app."""
     if sys.prefix == sys.base_prefix:
@@ -689,162 +580,31 @@ def get_tray_process_pids(exclude_current=True, snapshots=None):
     return pids
 
 
-def load_pid_entries():
-    if not os.path.exists(PID_FILE):
-        return []
-    try:
-        with open(PID_FILE, "r", encoding="utf-8") as f:
-            text = f.read().strip()
-    except OSError:
-        return []
-    if not text:
-        return []
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-
-    if isinstance(data, list):
-        entries = []
-        for item in data:
-            if isinstance(item, dict) and str(item.get("pid", "")).isdigit():
-                entries.append(item)
-        return entries
-
-    entries = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            entries.append({"pid": int(line), "role": "legacy"})
-    return entries
-
-
-def build_pid_entry(pid, role, snapshots=None):
-    snapshots = get_process_snapshots() if snapshots is None else snapshots
-    snapshot = snapshots.get(int(pid), {})
-    return {
-        "pid": int(pid),
-        "role": role,
-        "creation_date": snapshot.get("CreationDate"),
-    }
-
-
-def cleanup_tracked_processes():
-    try:
-        snapshots = get_process_snapshots()
-    except ProcessSnapshotError as error:
-        log_event(f"Browser cleanup could not inspect processes: {error}")
-        return False
-    entries = load_pid_entries()
-    attempted_pids = set()
-    for entry in entries:
-        try:
-            pid = int(entry.get("pid"))
-        except (TypeError, ValueError):
-            continue
-        role = entry.get("role")
-        snapshot = snapshots.get(pid, {})
-        if role in {"browser", "legacy"} and is_owned_browser_snapshot(snapshot):
-            taskkill_pid(pid)
-            attempted_pids.add(pid)
-        elif role == "driver" and is_tracked_driver_snapshot(
-            snapshot,
-            entry.get("creation_date"),
-        ):
-            taskkill_pid(pid)
-            attempted_pids.add(pid)
-
-    for pid in get_owned_chrome_pids(snapshots):
-        if pid not in attempted_pids:
-            taskkill_pid(pid)
-
-    try:
-        remaining_snapshots = get_process_snapshots()
-    except ProcessSnapshotError as error:
-        log_event(f"Browser cleanup could not verify process exit: {error}")
-        return False
-    remaining_browser_pids = get_owned_chrome_pids(remaining_snapshots)
-    remaining_driver_pids = {
-        int(entry["pid"])
-        for entry in entries
-        if (
-            str(entry.get("pid", "")).isdigit()
-            and entry.get("role") == "driver"
-            and is_tracked_driver_snapshot(
-                remaining_snapshots.get(int(entry["pid"]), {}),
-                entry.get("creation_date"),
-            )
-        )
-    }
-    if remaining_browser_pids or remaining_driver_pids:
-        return False
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
-    return True
-
-
-def hide_windows_by_pid(pids):
-    if not pids:
-        return
-    user32 = ctypes.windll.user32
-    GWL_EXSTYLE = -20
-    WS_EX_TOOLWINDOW = 0x00000080
-    WS_EX_APPWINDOW = 0x00040000
-
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-    def enum_callback(hwnd, lparam):
-        pid = ctypes.wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value in pids:
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-            user32.ShowWindow(hwnd, 0)
-        return True
-
-    user32.EnumWindows(enum_callback, 0)
-
-
 class FinalmouseTray:
-    reconnect_label = "Reconnect Browser"
+    """Display native receiver readings with the saved tray and history UI."""
 
-    def __init__(self, *, use_browser=True):
-        if use_browser:
-            _load_browser_support()
-        self.driver = None
+    reconnect_label = "Reconnect Receiver"
+
+    def __init__(self, *, reader=None):
+        self.native_reader = reader if reader is not None else NativeBatteryReader()
+        self.last_native_error = None
+        self.last_native_error_at = 0.0
         self.running = True
         self.icon = None
-        self.chrome_pids = set()
-        self.browser_pids = set()
-        self.browser_creation_times = {}
-        self.driver_pid = None
-        self.driver_creation_date = None
-        self.driver_creation_filetime = None
         self.is_charging = False
         self.charge_anim_thread = None
         self.charge_anim_stop = threading.Event()
-        self.hider_thread = None
         self.poll_thread = None
         self.watchdog_thread = None
         self.action_threads = set()
         self.action_threads_lock = threading.Lock()
-        self.browser_lock = threading.RLock()
+        self.reader_lock = threading.RLock()
         self.state_lock = threading.RLock()
         self.action_lock = threading.Lock()
         self.stop_event = threading.Event()
         self._display_key = None
         self._last_tooltip = None
         self._charging_frames = {}
-        self.last_restart_attempt = 0
-        self.restart_attempts = []
-        now = time.monotonic()
-        self.last_poll_heartbeat = now
-        self.last_page_refresh_at = 0
-        self.last_forced_cleanup_at = 0
-        self.last_connect_without_percent_log_at = 0
         self.cleanup_complete = False
         self.charge_log = load_charge_log()
         self._migrate_charge_log()
@@ -853,6 +613,81 @@ class FinalmouseTray:
         self.battery_pct = format_pct(self.charge_log.get("last_known_pct"))
         if self.battery_pct == "unknown":
             self.battery_pct = "..."
+
+    def start_reader(self):
+        # A missing receiver does not prevent the tray from starting.
+        with self.reader_lock:
+            if not self.running or self.stop_event.is_set() or self.cleanup_complete:
+                return False
+            log_event("Started native ULX battery reader")
+            return True
+
+    def close_reader(self):
+        if self.cleanup_complete:
+            return True
+        with self.reader_lock:
+            if not self.cleanup_complete:
+                self.native_reader.close()
+                self.cleanup_complete = True
+        return True
+
+    def read_battery(self):
+        if not self.running or self.stop_event.is_set() or self.cleanup_complete:
+            return None
+        with self.reader_lock:
+            if not self.running or self.stop_event.is_set() or self.cleanup_complete:
+                return None
+            try:
+                sample = self.native_reader.read()
+            except BatteryReadError as error:
+                now = time.monotonic()
+                reason = str(error)
+                if (reason != self.last_native_error
+                        or now - self.last_native_error_at >= EXPECTED_STATE_LOG_INTERVAL_SECONDS):
+                    log_event(f"Native battery reader: {reason}; preserving the last known reading")
+                    self.last_native_error, self.last_native_error_at = reason, now
+                return DISCONNECTED_READING if isinstance(error, DeviceUnavailable) else None
+            if self.last_native_error is not None:
+                log_event("Native battery reader recovered")
+                self.last_native_error = None
+            # Radio charging status and the verified wired USB connection both
+            # use the established charging UI. Wired mode has no voltage reply;
+            # preserve the session's starting percentage until wireless returns.
+            if sample.charging or sample.power_connected:
+                return CHARGING_READING
+            if (not sample.connected or sample.percent is None
+                    or sample.millivolts == 0):
+                return DISCONNECTED_READING
+            return format_pct(sample.percent)
+
+    def reconnect_receiver(self, reason):
+        if not self.running or self.stop_event.is_set() or self.cleanup_complete:
+            return None
+        with self.reader_lock:
+            if not self.running or self.stop_event.is_set() or self.cleanup_complete:
+                return None
+            self.native_reader.close()
+            log_event(f"Reconnecting native receiver: {reason}")
+            return self.read_battery()
+
+    def poll_loop(self):
+        while self.running and not self.stop_event.is_set():
+            try:
+                # Refresh/reconnect must not apply a newer sample between this
+                # read and its history/icon update.
+                with self.reader_lock:
+                    self._update_icon(self.read_battery())
+            except Exception as error:
+                log_event(f"Native poll recovered from error: {error.__class__.__name__}")
+            if self.stop_event.wait(POLL_INTERVAL):
+                break
+
+    def _watchdog_check(self):
+        if not self.running or self.stop_event.is_set() or self.cleanup_complete:
+            return
+        if self.poll_thread and not self.poll_thread.is_alive():
+            log_event("Native poll thread stopped; restarting polling")
+            self._start_poll_thread()
 
     def _text_color(self):
         return (0, 0, 0, 255) if self.dark_text else (255, 255, 255, 255)
@@ -943,484 +778,6 @@ class FinalmouseTray:
             return MAX_PENDING_CHARGE_SECONDS + 1
         now = datetime.now(started_at.tzinfo) if started_at.tzinfo else datetime.now()
         return max(0, int((now - started_at).total_seconds()))
-
-    def _cleanup_previous(self):
-        if not cleanup_tracked_processes():
-            log_event("Previous tracked browser processes did not exit")
-            return False
-
-        try:
-            owned_chrome_pids = get_owned_chrome_pids()
-        except ProcessSnapshotError as error:
-            log_event(f"Could not verify previous browser cleanup: {error}")
-            return False
-        if owned_chrome_pids:
-            log_event("Previous app-owned Chrome processes did not exit")
-            return False
-
-        for lock_name in ["lockfile", "SingletonLock", "SingletonCookie", "SingletonSocket"]:
-            try:
-                lock_path = os.path.join(CHROME_PROFILE_DIR, lock_name)
-                if os.path.exists(lock_path):
-                    os.remove(lock_path)
-            except OSError:
-                pass
-        return True
-
-    def _save_pids(self, snapshots=None):
-        try:
-            snapshots = get_process_snapshots() if snapshots is None else snapshots
-            entries = []
-            for pid in sorted(self.browser_pids):
-                snapshot = snapshots.get(pid, {})
-                if is_owned_browser_snapshot(snapshot):
-                    entries.append(build_pid_entry(pid, "browser", snapshots))
-            driver_snapshot = snapshots.get(self.driver_pid, {})
-            if self.driver_pid and is_tracked_driver_snapshot(
-                driver_snapshot,
-                self.driver_creation_date,
-            ):
-                entries.append(build_pid_entry(self.driver_pid, "driver", snapshots))
-            if entries != load_pid_entries():
-                save_json_file(PID_FILE, entries)
-        except (OSError, ProcessSnapshotError):
-            pass
-
-    def _track_browser_pids(self):
-        previous_driver_pid = self.driver_pid
-        previous_driver_creation_date = self.driver_creation_date
-        try:
-            service_pid = self.driver.service.process.pid
-        except Exception:
-            service_pid = None
-        snapshots = get_process_snapshots()
-        self.browser_pids = get_owned_chrome_pids(snapshots)
-        self.browser_creation_times = capture_process_creation_times(self.browser_pids)
-        self.chrome_pids = set(self.browser_pids)
-        self.driver_pid = service_pid
-        observed_creation_date = snapshots.get(service_pid, {}).get("CreationDate")
-        if observed_creation_date:
-            self.driver_creation_date = observed_creation_date
-        elif service_pid == previous_driver_pid:
-            self.driver_creation_date = previous_driver_creation_date
-        else:
-            self.driver_creation_date = None
-        if service_pid:
-            self.chrome_pids.add(service_pid)
-        self.driver_creation_filetime = get_process_creation_filetime(service_pid)
-        self._save_pids(snapshots)
-        hide_windows_by_pid(self.chrome_pids)
-
-    def _has_live_browser_process(self):
-        self.browser_pids = {
-            pid for pid in self.browser_pids
-            if (
-                pid in self.browser_creation_times
-                and get_process_creation_filetime(pid)
-                == self.browser_creation_times[pid]
-            )
-        }
-        self.browser_creation_times = {
-            pid: self.browser_creation_times[pid]
-            for pid in self.browser_pids
-        }
-        if self.browser_pids:
-            return True
-
-        if not self.driver:
-            return False
-
-        snapshots = get_process_snapshots()
-        self.browser_pids = get_owned_chrome_pids(snapshots)
-        self.browser_creation_times = capture_process_creation_times(self.browser_pids)
-        self.chrome_pids = set(self.browser_pids)
-        if (
-            self.driver_pid
-            and self.driver_creation_filetime is not None
-            and get_process_creation_filetime(self.driver_pid)
-            == self.driver_creation_filetime
-        ):
-            self.chrome_pids.add(self.driver_pid)
-        self._save_pids(snapshots)
-        return bool(self.browser_pids)
-
-    def start_browser(self):
-        if self.stop_event.is_set() or not self.running:
-            return False
-        with self.browser_lock:
-            if self.stop_event.is_set() or not self.running:
-                return False
-            os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
-            if not self._cleanup_previous():
-                return False
-            options = Options()
-            options.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
-            options.add_argument("--no-first-run")
-            options.add_argument("--no-default-browser-check")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-sync")
-            options.add_argument("--disable-background-networking")
-            # The hidden tray never uses Chrome's address-bar WebUI pages.
-            options.add_argument(
-                "--disable-features=WebUIOmniboxPopup,WebUIOmniboxAimPopup,"
-                "WebUIOmniboxFullPopup,WebUIOmniboxPopupDebug"
-            )
-            options.add_argument("--disable-gpu")
-            options.add_argument("--mute-audio")
-            options.add_argument("--user-agent=OpenAI File Downloader, XaiImageApiFetch/1.0")
-            options.add_argument("--log-level=3")
-            options.add_argument("--window-size=800,600")
-            options.add_argument("--window-position=-32000,-32000")
-            options.add_experimental_option("excludeSwitches", ["enable-logging"])
-
-            try:
-                service = QuietChromeService(log_output=subprocess.DEVNULL)
-                service.creation_flags = NO_WINDOW
-                self.driver = webdriver.Chrome(options=options, service=service)
-                if self.stop_event.is_set() or not self.running:
-                    self._kill_chrome_locked()
-                    return False
-                self.driver.command_executor.client_config.timeout = (
-                    WEBDRIVER_COMMAND_TIMEOUT_SECONDS
-                )
-                self.driver.set_page_load_timeout(20)
-                self.driver.set_script_timeout(10)
-                self._track_browser_pids()
-                if self.stop_event.is_set() or not self.running:
-                    self._kill_chrome_locked()
-                    return False
-
-                self.driver.get(XPANEL_URL)
-                if self.stop_event.is_set() or not self.running:
-                    self._kill_chrome_locked()
-                    return False
-                self.last_page_refresh_at = time.monotonic()
-                self._track_browser_pids()
-                if self.stop_event.is_set() or not self.running:
-                    self._kill_chrome_locked()
-                    return False
-
-                if not self.hider_thread or not self.hider_thread.is_alive():
-                    self.hider_thread = threading.Thread(
-                        target=self._persistent_hider,
-                        daemon=True,
-                    )
-                    self.hider_thread.start()
-                log_event(f"Started browser with tracked PIDs: {sorted(self.chrome_pids)}")
-                return True
-            except Exception as e:
-                log_event(f"Failed to start Chrome: {e}")
-                print(f"Failed to start Chrome: {e}", file=sys.stderr)
-                self._kill_chrome_locked()
-                return False
-
-    def _persistent_hider(self):
-        last_pid_refresh = time.monotonic()
-        while self.running and not self.stop_event.wait(HIDER_INTERVAL):
-            try:
-                now = time.monotonic()
-                with self.browser_lock:
-                    self.browser_pids = {
-                        pid for pid in self.browser_pids
-                        if (
-                            pid in self.browser_creation_times
-                            and get_process_creation_filetime(pid)
-                            == self.browser_creation_times[pid]
-                        )
-                    }
-                    self.browser_creation_times = {
-                        pid: self.browser_creation_times[pid]
-                        for pid in self.browser_pids
-                    }
-                    if now - last_pid_refresh >= PID_REFRESH_INTERVAL_SECONDS:
-                        # The browser owns the visible windows across renderer
-                        # reloads. Rediscover only after the cached identities
-                        # disappear; startup, recovery and cleanup also rescan.
-                        if not self.browser_pids:
-                            self._has_live_browser_process()
-                        last_pid_refresh = now
-                    self.chrome_pids = set(self.browser_pids)
-                    if (
-                        self.driver_pid
-                        and self.driver_creation_filetime is not None
-                        and get_process_creation_filetime(self.driver_pid)
-                        == self.driver_creation_filetime
-                    ):
-                        self.chrome_pids.add(self.driver_pid)
-                    pids_to_hide = set(self.chrome_pids)
-                hide_windows_by_pid(pids_to_hide)
-            except Exception:
-                pass
-
-    def _kill_chrome_locked(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
-            self.driver = None
-
-        try:
-            snapshots = get_process_snapshots()
-        except ProcessSnapshotError as error:
-            log_event(f"Browser cleanup inspection failed: {error}")
-            return False
-        for pid in get_owned_chrome_pids(snapshots):
-            taskkill_pid(pid)
-        if self.driver_pid and is_tracked_driver_snapshot(
-            snapshots.get(self.driver_pid, {}),
-            self.driver_creation_date,
-        ):
-            taskkill_pid(self.driver_pid)
-
-        try:
-            remaining_snapshots = get_process_snapshots()
-        except ProcessSnapshotError as error:
-            log_event(f"Browser cleanup verification failed: {error}")
-            return False
-        remaining_browser_pids = get_owned_chrome_pids(remaining_snapshots)
-        driver_still_running = bool(
-            self.driver_pid
-            and is_tracked_driver_snapshot(
-                remaining_snapshots.get(self.driver_pid, {}),
-                self.driver_creation_date,
-            )
-        )
-        if remaining_browser_pids or driver_still_running:
-            self.browser_pids = remaining_browser_pids
-            self.browser_creation_times = capture_process_creation_times(
-                remaining_browser_pids
-            )
-            self.chrome_pids = set(remaining_browser_pids)
-            if driver_still_running:
-                self.chrome_pids.add(self.driver_pid)
-                self.driver_creation_filetime = get_process_creation_filetime(
-                    self.driver_pid
-                )
-            else:
-                self.driver_pid = None
-                self.driver_creation_date = None
-                self.driver_creation_filetime = None
-            self._save_pids(remaining_snapshots)
-            log_event(
-                "Browser cleanup left tracked processes running: "
-                f"{sorted(self.chrome_pids)}"
-            )
-            return False
-        try:
-            os.remove(PID_FILE)
-        except OSError:
-            pass
-        self.chrome_pids = set()
-        self.browser_pids = set()
-        self.browser_creation_times = {}
-        self.driver_pid = None
-        self.driver_creation_date = None
-        self.driver_creation_filetime = None
-        return True
-
-    def kill_chrome(self):
-        if self.cleanup_complete:
-            return True
-        with self.browser_lock:
-            if self.cleanup_complete:
-                return True
-            cleaned = self._kill_chrome_locked()
-            if cleaned:
-                self.cleanup_complete = True
-            return cleaned
-
-    def _restart_allowed(self, force):
-        if force:
-            return True
-        now = time.monotonic()
-        self.restart_attempts = [
-            attempt for attempt in self.restart_attempts
-            if now - attempt < RESTART_WINDOW_SECONDS
-        ]
-        if now - self.last_restart_attempt < RESTART_COOLDOWN_SECONDS:
-            wait_left = int(RESTART_COOLDOWN_SECONDS - (now - self.last_restart_attempt))
-            log_event(f"Browser restart skipped by cooldown, wait {wait_left}s")
-            return False
-        if len(self.restart_attempts) >= MAX_RESTARTS_PER_WINDOW:
-            log_event("Browser restart skipped by safety limit")
-            return False
-        self.last_restart_attempt = now
-        self.restart_attempts.append(now)
-        return True
-
-    def restart_browser(self, reason, force=False):
-        if self.stop_event.is_set() or not self.running:
-            return None
-        with self.browser_lock:
-            if self.stop_event.is_set() or not self.running:
-                return None
-            if not self._restart_allowed(force):
-                return None
-            log_event(f"Restarting browser: {reason}")
-            self._kill_chrome_locked()
-            if self.stop_event.is_set() or not self.running:
-                return None
-            with self.state_lock:
-                color = self._dim_text_color()
-                self._set_icon_image_locked(
-                    ("reconnecting", bool(self.dark_text)),
-                    lambda: create_battery_icon("...", color=color),
-                )
-                self._set_tooltip_text_locked("Finalmouse ULX: Reconnecting...")
-            if not self.start_browser():
-                log_event("Browser restart failed")
-                return None
-            reading = self._wait_for_battery_locked(
-                REFRESH_SETTLE_SECONDS,
-                minimum_wait_seconds=REFRESH_MIN_SETTLE_SECONDS,
-            )
-            log_event(f"Browser restart reading: {reading}")
-            return reading
-
-    def _read_battery_locked(self):
-        if not self.driver:
-            log_event("Browser read failed: driver is not initialized")
-            return BROWSER_ERROR
-        try:
-            visible_reading = None
-            visible_pct = None
-            els = self.driver.find_elements(By.CSS_SELECTOR, ".battery-text")
-            for el in els:
-                if not el.is_displayed():
-                    continue
-                reading = normalize_reading(el.text)
-                pct = parse_percent(reading)
-                if pct is not None:
-                    visible_reading = reading
-                    visible_pct = pct
-                    break
-
-            connect_visible = False
-            buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
-            for btn in buttons:
-                if btn.text.strip() == "Connect" and btn.is_displayed():
-                    connect_visible = True
-                    break
-
-            if visible_pct is not None:
-                if connect_visible and visible_pct == 0:
-                    return CHARGING_READING
-                return visible_reading
-
-            body_text = self.driver.find_element(By.TAG_NAME, "body").text
-            reading = normalize_reading(body_text)
-            pct = parse_percent(reading)
-            if pct is not None:
-                if connect_visible and pct == 0:
-                    return CHARGING_READING
-                return reading
-            if connect_visible:
-                now = time.monotonic()
-                last_logged = getattr(
-                    self,
-                    "last_connect_without_percent_log_at",
-                    0,
-                )
-                if now - last_logged >= EXPECTED_STATE_LOG_INTERVAL_SECONDS:
-                    log_event(
-                        "Xpanel shows Connect without a visible battery percent; "
-                        "preserving the last known percent"
-                    )
-                    self.last_connect_without_percent_log_at = now
-                return DISCONNECTED_READING
-            return None
-        except WebDriverException as e:
-            log_event(f"Browser read failed: {e.__class__.__name__}: {str(e)[:250]}")
-            return BROWSER_ERROR
-        except Exception as e:
-            log_event(f"Battery read failed unexpectedly: {e.__class__.__name__}: {str(e)[:250]}")
-            return None
-
-    def _wait_for_battery_locked(self, timeout_seconds, minimum_wait_seconds=0):
-        started_at = time.monotonic()
-        deadline = started_at + max(0, timeout_seconds)
-        initial_wait = min(max(0, minimum_wait_seconds), max(0, timeout_seconds))
-        if initial_wait and self.stop_event.wait(initial_wait):
-            return None
-        reading = None
-        while self.running and not self.stop_event.is_set():
-            reading = self._read_battery_locked()
-            if reading == BROWSER_ERROR:
-                return reading
-            if battery_state(reading):
-                return reading
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            self.stop_event.wait(min(READ_RETRY_INTERVAL_SECONDS, remaining))
-        return reading
-
-    def read_battery(self):
-        if self.stop_event.is_set() or not self.running:
-            return None
-        with self.browser_lock:
-            if self.stop_event.is_set() or not self.running:
-                return None
-            if not self._has_live_browser_process():
-                log_event("Browser read failed: tracked Chrome process is not running")
-                return BROWSER_ERROR
-            return self._read_battery_locked()
-
-    def recover_browser(
-        self,
-        reason,
-        force_restart=False,
-        force_restart_on_failure=False,
-    ):
-        if self.stop_event.is_set() or not self.running:
-            return None
-        with self.browser_lock:
-            if self.stop_event.is_set() or not self.running:
-                return None
-            if force_restart:
-                return self.restart_browser(reason, force=True)
-            if not self.driver:
-                return self.restart_browser(
-                    f"{reason}; browser missing",
-                    force=force_restart_on_failure,
-                )
-            if not self._has_live_browser_process():
-                return self.restart_browser(
-                    f"{reason}; tracked Chrome process missing",
-                    force=force_restart_on_failure,
-                )
-
-            if reason != "scheduled page refresh":
-                log_event(f"Refreshing browser: {reason}")
-            try:
-                self.driver.refresh()
-                self.last_page_refresh_at = time.monotonic()
-                reading = self._wait_for_battery_locked(
-                    REFRESH_SETTLE_SECONDS,
-                    minimum_wait_seconds=REFRESH_MIN_SETTLE_SECONDS,
-                )
-            except WebDriverException as e:
-                log_event(f"Refresh failed: {e.__class__.__name__}: {str(e)[:250]}")
-                reading = BROWSER_ERROR
-            except Exception as e:
-                log_event(f"Refresh failed unexpectedly: {e.__class__.__name__}: {str(e)[:250]}")
-                reading = BROWSER_ERROR
-
-            if self.stop_event.is_set() or not self.running:
-                return None
-            if battery_state(reading):
-                return reading
-            return self.restart_browser(
-                f"{reason}; refresh did not recover",
-                force=force_restart_on_failure,
-            )
-
-    def _page_refresh_due(self):
-        return (
-            time.monotonic() - self.last_page_refresh_at
-            >= PAGE_REFRESH_INTERVAL_SECONDS
-        )
 
     def _build_tooltip(self):
         if self.is_charging:
@@ -1691,53 +1048,6 @@ class FinalmouseTray:
             )
             self._set_tooltip_locked()
 
-    def poll_loop(self):
-        if self.stop_event.wait(POLL_INTERVAL):
-            return
-        prev_state = None
-        none_count = 0
-
-        while self.running and not self.stop_event.is_set():
-            self.last_poll_heartbeat = time.monotonic()
-            try:
-                with self.browser_lock:
-                    if self._page_refresh_due():
-                        reading = self.recover_browser("scheduled page refresh")
-                    else:
-                        reading = self.read_battery()
-                    if reading == BROWSER_ERROR:
-                        reading = self.restart_browser("lost Selenium browser connection")
-                        prev_state = None
-
-                    cur_state = battery_state(reading)
-
-                    if prev_state and cur_state and cur_state != prev_state:
-                        reading = self.recover_browser("battery state changed")
-                        cur_state = battery_state(reading)
-
-                    if cur_state is None:
-                        none_count += 1
-                        if none_count >= 3:
-                            reading = self.recover_browser("three empty battery reads")
-                            cur_state = battery_state(reading)
-                            none_count = 0
-                    else:
-                        none_count = 0
-
-                    if cur_state is not None:
-                        prev_state = cur_state
-                    self._update_icon(reading)
-            except Exception as e:
-                log_event(
-                    "Poll loop recovered from error: "
-                    f"{e.__class__.__name__}: {str(e)[:250]}"
-                )
-            finally:
-                self.last_poll_heartbeat = time.monotonic()
-
-            if self.stop_event.wait(POLL_INTERVAL):
-                break
-
     def _start_poll_thread(self):
         if self.stop_event.is_set() or not self.running:
             return
@@ -1764,61 +1074,6 @@ class FinalmouseTray:
                 log_event(f"Watchdog recovered from error: {e.__class__.__name__}: {str(e)[:250]}")
             if self.stop_event.wait(WATCHDOG_INTERVAL_SECONDS):
                 break
-
-    def _watchdog_check(self):
-        if self.stop_event.is_set() or not self.running:
-            return
-        if self.poll_thread and not self.poll_thread.is_alive():
-            log_event("Poll thread was not running; starting a new poll thread")
-            self._start_poll_thread()
-
-        stale_for = time.monotonic() - self.last_poll_heartbeat
-        if not self.browser_lock.acquire(blocking=False):
-            if stale_for > WATCHDOG_STALE_SECONDS:
-                self._force_cleanup_stuck_browser(stale_for)
-            return
-
-        try:
-            missing_browser = not self.driver or not self._has_live_browser_process()
-            stale_poll = stale_for > WATCHDOG_STALE_SECONDS
-
-            if not missing_browser and not stale_poll:
-                return
-
-            reasons = []
-            if missing_browser:
-                reasons.append("tracked Chrome process missing")
-            if stale_poll:
-                reasons.append(f"poll stale for {int(stale_for)}s")
-            reason = "watchdog: " + ", ".join(reasons)
-
-            if not self.action_lock.acquire(blocking=False):
-                log_event(f"{reason}; skipped because a menu action is running")
-                return
-            try:
-                reading = self.restart_browser(reason)
-                self._update_icon(reading)
-            finally:
-                self.action_lock.release()
-        finally:
-            self.browser_lock.release()
-
-    def _force_cleanup_stuck_browser(self, stale_for):
-        if self.stop_event.is_set() or not self.running:
-            return
-        now = time.monotonic()
-        if now - self.last_forced_cleanup_at < RESTART_COOLDOWN_SECONDS:
-            log_event(
-                "Watchdog skipped stuck-browser cleanup by cooldown, "
-                f"poll stale for {int(stale_for)}s"
-            )
-            return
-        self.last_forced_cleanup_at = now
-        log_event(
-            "Watchdog forcing browser cleanup to unblock Selenium, "
-            f"poll stale for {int(stale_for)}s"
-        )
-        cleanup_tracked_processes()
 
     def _run_menu_action(self, label, target):
         if self.stop_event.is_set() or not self.running:
@@ -1855,19 +1110,16 @@ class FinalmouseTray:
 
     def on_refresh(self, icon, item):
         def refresh():
-            with self.browser_lock:
-                reading = self.recover_browser(
-                    "manual refresh",
-                    force_restart_on_failure=True,
-                )
+            with self.reader_lock:
+                reading = self.reconnect_receiver("manual refresh")
                 self._update_icon(reading)
 
         self._run_menu_action("Refresh", refresh)
 
     def on_reconnect(self, icon, item):
         def reconnect():
-            with self.browser_lock:
-                reading = self.restart_browser("manual reconnect", force=True)
+            with self.reader_lock:
+                reading = self.reconnect_receiver("manual reconnect")
                 self._update_icon(reading)
 
         self._run_menu_action(self.reconnect_label, reconnect)
@@ -1912,7 +1164,6 @@ class FinalmouseTray:
             action_threads = tuple(self.action_threads)
         for thread in (
             self.charge_anim_thread,
-            self.hider_thread,
             self.poll_thread,
             self.watchdog_thread,
             *action_threads,
@@ -1925,9 +1176,9 @@ class FinalmouseTray:
             thread.join(remaining)
 
     def run(self):
-        atexit.register(self.kill_chrome)
+        atexit.register(self.close_reader)
         try:
-            if not self.start_browser():
+            if not self.start_reader():
                 print("Could not initialize battery reader. Exiting.", file=sys.stderr)
                 sys.exit(1)
 
@@ -1957,116 +1208,17 @@ class FinalmouseTray:
             self.icon.run()
         finally:
             self._signal_stop()
-            self.kill_chrome()
+            self.close_reader()
             self._join_worker_threads()
 
 
-class NativeFinalmouseTray(FinalmouseTray):
-    """Use the existing tray/history UI with a bounded native receiver reader."""
-
-    reconnect_label = "Reconnect Receiver"
-
-    def __init__(self, *, reader=None):
-        super().__init__(use_browser=False)
-        from native_hid import NativeBatteryReader
-        self.native_reader = reader if reader is not None else NativeBatteryReader()
-        self.last_native_error = None
-        self.last_native_error_at = 0.0
-
-    def start_browser(self):
-        # Base run() supplies the established tray/menu/shutdown lifecycle.
-        # A missing receiver does not prevent the tray from starting.
-        with self.browser_lock:
-            if not self.running or self.stop_event.is_set():
-                return False
-            # An unclean exit from the former browser mode can leave Chrome
-            # holding the receiver. Reuse its verified cleanup once at startup;
-            # native polling and menu actions never launch discovery helpers.
-            if not self._cleanup_previous():
-                return False
-            log_event("Started native ULX battery reader")
-            return self.running and not self.stop_event.is_set()
-
-    def kill_chrome(self):
-        if self.cleanup_complete:
-            return True
-        with self.browser_lock:
-            if not self.cleanup_complete:
-                self.native_reader.close()
-                self.cleanup_complete = True
-        return True
-
-    def read_battery(self):
-        from native_hid import BatteryReadError, DeviceUnavailable
-        if not self.running or self.stop_event.is_set():
-            return None
-        with self.browser_lock:
-            if not self.running or self.stop_event.is_set():
-                return None
-            try:
-                sample = self.native_reader.read()
-            except BatteryReadError as error:
-                now = time.monotonic()
-                reason = str(error)
-                if (reason != self.last_native_error
-                        or now - self.last_native_error_at >= EXPECTED_STATE_LOG_INTERVAL_SECONDS):
-                    log_event(f"Native battery reader: {reason}; preserving the last known reading")
-                    self.last_native_error, self.last_native_error_at = reason, now
-                return DISCONNECTED_READING if isinstance(error, DeviceUnavailable) else None
-            if self.last_native_error is not None:
-                log_event("Native battery reader recovered")
-                self.last_native_error = None
-            # Radio charging status and the verified wired USB connection both
-            # use the established charging UI. Wired mode has no voltage reply;
-            # preserve the session's starting percentage until wireless returns.
-            if sample.charging or sample.power_connected:
-                return CHARGING_READING
-            if (not sample.connected or sample.percent is None
-                    or sample.millivolts == 0):
-                return DISCONNECTED_READING
-            return format_pct(sample.percent)
-
-    def recover_browser(self, reason, force_restart=False, force_restart_on_failure=False):
-        if force_restart or force_restart_on_failure:
-            return self.restart_browser(reason, force=True)
-        return self.read_battery()
-
-    def restart_browser(self, reason, force=False):
-        if not self.running or self.stop_event.is_set():
-            return None
-        with self.browser_lock:
-            self.native_reader.close()
-            log_event(f"Reconnecting native receiver: {reason}")
-            return self.read_battery()
-
-    def poll_loop(self):
-        # Direct queries need neither page reloads nor browser-settle delays.
-        while self.running and not self.stop_event.is_set():
-            self.last_poll_heartbeat = time.monotonic()
-            try:
-                # Refresh/reconnect must not apply a newer sample between this
-                # read and its history/icon update.
-                with self.browser_lock:
-                    self._update_icon(self.read_battery())
-            except Exception as error:
-                log_event(f"Native poll recovered from error: {error.__class__.__name__}")
-            finally:
-                self.last_poll_heartbeat = time.monotonic()
-            if self.stop_event.wait(POLL_INTERVAL):
-                break
-
-    def _watchdog_check(self):
-        if not self.running or self.stop_event.is_set():
-            return
-        if self.poll_thread and not self.poll_thread.is_alive():
-            log_event("Native poll thread stopped; restarting polling")
-            self._start_poll_thread()
-
-
 if __name__ == "__main__":
+    if sys.argv[1:]:
+        print("Unsupported arguments. Run finalmouse_tray.py without arguments.", file=sys.stderr)
+        sys.exit(2)
     if not acquire_lock():
         print("Already running. Exiting.", file=sys.stderr)
         sys.exit(0)
     atexit.register(release_lock)
-    app = FinalmouseTray() if "--browser" in sys.argv[1:] else NativeFinalmouseTray()
+    app = FinalmouseTray()
     app.run()

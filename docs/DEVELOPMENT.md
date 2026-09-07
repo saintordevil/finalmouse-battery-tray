@@ -2,18 +2,11 @@
 
 Install the project first. Run these commands in Command Prompt, replacing the example path with your checkout location.
 
-The native reader, integration, and Windows launcher checks use the normal dependencies:
+The full regression suite uses the same native dependencies as the application:
 
 ```bat
 cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray"
-".venv\Scripts\python.exe" -B -m unittest tests.test_native_hid tests.test_finalmouse_tray.NativeIntegrationTests tests.test_launchers -v
-```
-
-The full regression suite also needs Selenium, although these tests do not launch Chrome:
-
-```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray"
-".venv\Scripts\python.exe" -m pip install -r requirements-browser.txt
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
 ".venv\Scripts\python.exe" -B -m unittest discover -v
 ```
 
@@ -25,7 +18,7 @@ Tests use fake HID responses and isolated application state. Windows launcher an
 
 At most one receiver handle remains open. Each status query shares a 350 ms response deadline and 64-report limit between queue draining and response reading. Synchronous OS enumeration, open, write, and close calls are outside that response-time guarantee. Failed reads close the handle for rediscovery. Polling and manual actions serialize reading and applying results to prevent stale charge-history updates.
 
-`finalmouse_tray.py` owns the UI, charge tracking, and optional browser reader. Native startup checks for verified leftovers from the isolated browser profile; its temporary discovery helpers exit. Ordinary native polling and reconnects do not launch browser helpers.
+`finalmouse_tray.py` owns the tray UI, native polling, and charge tracking. Polling reuses the receiver handle; refresh and reconnect request a new connection.
 
 On Windows, a virtual environment can retain a small Python redirector process. Startup excludes only the current interpreter's verified redirector from duplicate detection. The named mutex and other app-instance checks remain active.
 
