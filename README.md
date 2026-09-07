@@ -1,179 +1,84 @@
 # Finalmouse Battery Tray
 
-Windows tray monitor for Finalmouse ULX battery status. It keeps a hidden Chrome session connected to Finalmouse Xpanel and renders the battery percentage directly in the system tray.
+A lightweight Windows tray monitor for Finalmouse ULX battery status. It reads the receiver directly through native HID, displays the battery percentage beside your clock, and shows a pulsing bolt for charging or a wired USB power connection.
 
-The app is designed for a quiet daily setup: no visible browser, no console window, low polling overhead, manual recovery controls, and charge history in the tray tooltip.
-
-## Features
-
-| Feature | Details |
-|---|---|
-| Tray battery icon | Shows the current battery percentage as the tray icon |
-| Charging icon | Shows a pulsing lightning bolt while charging |
-| Consistent text size | Keeps `100` visually aligned with `0` through `99` |
-| Hidden browser session | Uses an isolated Chrome profile for Xpanel |
-| Manual refresh | Right-click `Refresh` reloads Xpanel and falls back to browser restart if needed |
-| Scheduled refresh | Reloads Xpanel every 60 seconds so stale hidden tabs do not freeze the percentage |
-| Manual reconnect | Right-click `Reconnect Browser` restarts only the app-owned browser session |
-| Last charged tooltip | Shows when the mouse last finished charging, from percent, to percent, and duration |
-| Text color toggle | Right-click `Dark text` to switch the tray number from white to black |
-| Watchdog recovery | Restarts the isolated browser if Chrome disappears or polling gets stale |
-| Restart safety | Uses locks, cooldowns, and restart limits to avoid Chrome restart loops |
-| Safer cleanup | Kills only Chrome processes tied to the isolated Finalmouse profile |
-| Durable state | Uses atomic JSON writes and avoids rewriting unchanged battery state |
-| Bounded logs | Rotates the runtime log at 1 MB instead of growing without limit |
-
-## Requirements
-
-* Windows 10 or Windows 11
-* Python 3.10+
-* Google Chrome
-* Python packages:
-
-```bat
-python -m pip install -r requirements.txt
-```
+**Native mode needs no Chrome, Selenium, Xpanel login, or registry changes.** It polls every 10 seconds and saves your charge history and text-color preference locally.
 
 ## Install
 
-Clone the repo or download the folder, then install dependencies:
+You need Windows 10/11, **64-bit Python 3.10 or newer**, and a compatible Finalmouse ULX mouse and receiver. Python 3.11 is the tested version. Physical validation used a ULX Prophecy Tfue Wireless, Small, on Windows 11; other models and firmware have not all been verified.
 
-```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
-python -m pip install -r requirements.txt
-```
+1. Install [64-bit Python for Windows](https://www.python.org/downloads/windows/) if needed. Include the Python launcher or add Python to PATH.
+2. [Download the project ZIP](https://github.com/saintordevil/finalmouse-battery-tray/archive/refs/heads/master.zip) and extract the complete folder to a permanent location. You can also clone this repository.
+3. Double-click **`install.bat`**. Wait for **Installation complete**. It creates a local `.venv` and installs Pillow, pystray, and hidapi. Internet access is needed for this step.
+4. Connect the receiver, turn on the mouse, and double-click **`start.bat`**.
+5. If the icon is hidden, open the tray's hidden-icons arrow and drag it beside your clock.
 
-## Chrome WebHID Policy
+For a launch without a console flash, double-click **`finalmouse_tray_silent.vbs`**. The launchers need Windows Script Host, use the environment beside them, and work with different usernames and folder paths. The installer does not install Python or alter your global Python packages. Native monitoring needs no network connection.
 
-Finalmouse Xpanel uses WebHID to talk to the mouse. Chrome needs a policy entry so the hidden browser can access the mouse without a visible permission prompt.
+### Start with Windows
 
-Run `setup_policy.reg` as Administrator before first use.
+Create a shortcut to `finalmouse_tray_silent.vbs`. Press **Win+R**, enter **`shell:startup`**, and place the shortcut there. Keep the app in its permanent folder. Remove the shortcut to disable automatic startup.
 
-## First Run
+### Upgrade
 
-The app stores its isolated Chrome profile in:
+Choose **Quit** from the tray menu, or run **`stop.bat`**. Copy the new project files over your existing installation, preserving `.venv`, then run **`install.bat`** and **`start.bat`** again. If updating a Git checkout, preserve any local changes.
 
-```text
-%LOCALAPPDATA%\finalmouse-tray\chrome-isolated
-```
+Settings and history live in `%LOCALAPPDATA%\finalmouse-tray`, separate from the app folder. Keep that data folder during upgrades. When moving to another PC or folder, run the installer there instead of copying `.venv`.
 
-If Xpanel needs a first-time login, pairing, or permission approval:
+## Use
 
-1. Temporarily edit `finalmouse_tray.py`.
-2. Comment out the `--window-position=-32000,-32000` line.
-3. Run `start.bat`.
-4. Complete the Xpanel setup in Chrome.
-5. Stop the app with `stop.bat`.
-6. Restore the hidden window line and start the app again.
+Hover over the tray icon for charge details. Right-click for:
 
-## Usage
-
-```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
-start.bat
-```
-
-Stop the app:
-
-```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
-stop.bat
-```
-
-For a silent launch with no console window, run:
-
-```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
-wscript finalmouse_tray_silent.vbs
-```
-
-## Tray Menu
-
-| Menu item | Action |
+| Control | Action |
 |---|---|
-| `Refresh` | Reloads Xpanel, waits for a fresh read, then restarts the browser if refresh fails |
-| `Reconnect Browser` | Forces a clean restart of the isolated browser session |
-| `Dark text` | Toggles the tray icon number between white and black text |
-| `Quit` | Stops the tray app and cleans up app-owned browser processes |
+| **Refresh** | Reopens the receiver and requests a fresh reading |
+| **Reconnect Receiver** | Reconnects the native reader and reads its status |
+| **Dark text** | Switches the percentage and bolt between light and dark text |
+| **Quit** | Stops the app and releases the receiver |
+
+Only one instance runs at a time. **`stop.bat`** also stops the app using the included PowerShell helper.
+
+A disconnected or unavailable receiver dims the last known percentage; the first run shows `...` until a reading arrives. The reader retries automatically. Removing the receiver alone does not mean the mouse is charging.
+
+### Wired power and charge history
+
+Moving the USB cable from the receiver to the mouse activates the bolt and preserves the last wireless percentage. **The wired bolt indicates USB power connection, not measured charging current or a fresh wired battery percentage.** It may remain visible at full charge.
+
+A pending charge session stays open through unavailable readings. Reconnect the wireless receiver and wait for a fresh, noncharging percentage to finish it. The recorded duration includes that wait. The tooltip shows the active session and most recent completed charge; sessions without a known starting percentage or an increase are not saved as completed charges.
 
 ## Screenshots
 
-| Charging details | Charging bolt fade |
+| Charge details | Percentage |
 |---|---|
-| ![Charging tray icon with charge details](assets/charging-details.png) | ![Charging tray icon showing a faded lightning bolt](assets/charging-bolt-gradient.png) |
-| Current percent | Dark text percent |
-| ![Battery percent tray icon with charge details](assets/battery-percent-details.png) | ![Dark text battery percent tray icon](assets/dark-text-percent.png) |
-| Dark text charging | |
-| ![Dark text charging lightning bolt tray icon](assets/dark-text-charging.png) | |
+| ![Tray bolt with charge details](assets/charging-details.png) | ![Battery percentage with charge details](assets/battery-percent-details.png) |
+| Bolt fade | Dark text |
+| ![Faded bolt animation](assets/charging-bolt-gradient.png) | ![Dark text percentage](assets/dark-text-percent.png) |
+| Dark text bolt | |
+| ![Dark text charging bolt](assets/dark-text-charging.png) | |
 
-## Charge History
+## Troubleshooting
 
-The tooltip tracks completed charge sessions:
-
-```text
-Last charged: 21/05 10:42pm, 54% to 100% in 1h 18m
-```
-
-While charging, it shows the active session start:
-
-```text
-Charging from 54% since 21/05 09:24pm
-```
-
-Charge and settings data are stored in:
-
-```text
-%LOCALAPPDATA%\finalmouse-tray\charge_log.json
-%LOCALAPPDATA%\finalmouse-tray\settings.json
-%LOCALAPPDATA%\finalmouse-tray\tray.log
-```
-
-## Reliability Notes
-
-* Automatic recovery uses a real page refresh first.
-* The hidden Xpanel tab is refreshed every 60 seconds to pick up battery changes and charging transitions.
-* A visible battery percentage takes priority over Xpanel `Connect`, except `Connect` with `0%` is treated as charging recovery without overwriting the last known battery percent.
-* `Connect` by itself is treated as a normal disconnected state. The tray preserves the last known percentage and waits for the scheduled refresh instead of restarting Chrome repeatedly.
-* If Selenium reports that Chrome is gone, the app restarts the browser.
-* A low-frequency watchdog checks that the poll thread and tracked Chrome process are still alive.
-* If Selenium holds the browser lock too long, the watchdog cleans up only the app-owned browser processes so polling can recover.
-* Automatic browser restarts are limited to 4 attempts per 5 minutes.
-* Automatic browser restarts have a 30 second cooldown.
-* Manual `Refresh` can force a restart if a normal page refresh does not recover the battery read.
-* Menu actions are serialized so refresh and reconnect cannot fight each other.
-* Cleanup verifies the isolated Chrome profile path before killing Chrome.
-* A Windows named mutex prevents simultaneous startup before state is loaded.
-* The stop helper holds that mutex throughout cleanup so another instance cannot start midway through shutdown.
-* Process discovery uses one batched snapshot instead of one PowerShell launch per Chrome PID.
-* Battery state and tray updates are serialized so an older browser sample cannot overwrite a newer one.
-* Unchanged battery percentages do not rewrite the charge log or redraw the icon.
-* Runtime JSON files are replaced atomically so an interrupted write cannot leave partial JSON.
-* Normal scheduled refreshes and expected watchdog lock contention are not written to the log.
-
-## Tests
-
-The regression suite does not launch Chrome or create a tray icon:
-
-```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray-github"
-set "PYTHONDONTWRITEBYTECODE=1"
-python -m unittest discover -v
-```
-
-## File Overview
-
-| File | Purpose |
+| Symptom | Check |
 |---|---|
-| `finalmouse_tray.py` | Tray app, browser control, battery polling, charge tracking |
-| `start.bat` | Starts the tray app minimized with `pythonw` |
-| `stop.bat` | Stops the tray app through the PowerShell cleanup helper |
-| `stop_finalmouse.ps1` | Dependency-free process cleanup for tray and app-owned Chrome processes |
-| `finalmouse_tray_silent.vbs` | Starts the tray app without a console window |
-| `setup_policy.reg` | Chrome WebHID policy for Finalmouse Xpanel |
-| `requirements.txt` | Tested runtime dependency ranges |
-| `tests/` | Unit and Windows process-safety regression tests |
-| `LICENSE` | MIT license text |
+| Python is not found | Install 64-bit Python 3.10+ with its launcher or PATH entry, then rerun `install.bat`. |
+| Missing dependencies or launch files | Extract the complete project and run `install.bat` in that same folder. Check the installer's error if it fails. |
+| Existing `.venv` is incompatible | The installer preserves it and stops. Repair it, or extract to a new folder and install there. |
+| No tray icon | Check hidden tray icons, then inspect `%LOCALAPPDATA%\finalmouse-tray\tray.log`. |
+| Dim percentage or `...` | Connect the receiver, wake the mouse, and wait for a poll or choose **Refresh**. Close other software holding the receiver if reads keep failing. |
+| Ambiguous devices | Use one supported mouse/receiver setup. Duplicate matching interfaces are rejected; multiple mice are not paired to receivers by this tool. |
+| Bolt stays after unplugging | Restore the receiver connection and wait for a valid wireless, noncharging reading. |
+
+Your data folder contains `charge_log.json`, `settings.json`, and the bounded diagnostic `tray.log`. To back up history and preferences, quit the app and copy the two JSON files. Unchanged readings do not rewrite the history file or redraw the percentage icon.
+
+## Resource use and further details
+
+The published `.venv` installation settled at **38.89 MiB resident RAM** and **22.70 MiB private committed memory** in the measured Windows 11 run. It retained the tray interpreter and Windows' small Python environment launcher, with no browser. Startup briefly uses process-cleanup helpers. These are observations on one PC, not guaranteed ceilings.
+
+- [Release changes, measurements, and validation](CHANGELOG.md)
+- [Optional Xpanel browser fallback](docs/BROWSER_FALLBACK.md)
+- [Development and tests](docs/DEVELOPMENT.md)
 
 ## License
 
-MIT
+[MIT](LICENSE)

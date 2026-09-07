@@ -1,7 +1,8 @@
 """
 Finalmouse ULX Battery Tray Monitor
 Displays battery percentage in the Windows system tray.
-Reads from xpanel.finalmouse.com via a hidden Chrome instance.
+Reads the receiver directly using Xpanel's battery protocol and conversion.
+The previous browser reader remains available with --browser.
 """
 import atexit
 import ctypes
@@ -20,10 +21,8 @@ from datetime import datetime
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+
+webdriver = WebDriverException = Options = By = QuietChromeService = None
 
 POLL_INTERVAL = 10
 HIDER_INTERVAL = 5
@@ -80,13 +79,23 @@ class ProcessSnapshotError(RuntimeError):
     pass
 
 
-class QuietChromeService(webdriver.ChromeService):
-    def command_line_args(self):
-        return [
-            arg
-            for arg in super().command_line_args()
-            if arg != "--enable-chrome-logs"
-        ]
+def _load_browser_support():
+    """Keep Selenium and its dependency graph out of the native tray process."""
+    global webdriver, WebDriverException, Options, By, QuietChromeService
+    if webdriver is not None:
+        return
+    from selenium import webdriver as selenium_webdriver
+    from selenium.common.exceptions import WebDriverException as DriverError
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.common.by import By as SeleniumBy
+
+    class ChromeService(selenium_webdriver.ChromeService):
+        def command_line_args(self):
+            return [arg for arg in super().command_line_args()
+                    if arg != "--enable-chrome-logs"]
+
+    webdriver, WebDriverException = selenium_webdriver, DriverError
+    Options, By, QuietChromeService = ChromeOptions, SeleniumBy, ChromeService
 
 
 def load_json_file(path, fallback):
@@ -623,9 +632,39 @@ def taskkill_pid(pid):
         return False
 
 
+def get_venv_launcher_pid(snapshots):
+    """Identify this interpreter's Windows venv redirector, not another app."""
+    if sys.prefix == sys.base_prefix:
+        return None
+    current_pid = os.getpid()
+    current = snapshots.get(current_pid, {})
+    parent_pid = current.get("ParentProcessId")
+    if not isinstance(parent_pid, int) or parent_pid != os.getppid():
+        return None
+    parent = snapshots.get(parent_pid, {})
+    if str(parent.get("Name", "")).lower() not in {"python.exe", "pythonw.exe"}:
+        return None
+    current_args = split_windows_command_line(current.get("CommandLine"))
+    parent_args = split_windows_command_line(parent.get("CommandLine"))
+    if (
+        len(current_args) < 2
+        or len(parent_args) < 2
+        or not os.path.isabs(parent_args[0])
+        or normalize_path_for_match(parent_args[0]) != normalize_path_for_match(sys.executable)
+        or parent_args[1:] != current_args[1:]
+    ):
+        return None
+    current_created = get_process_creation_filetime(current_pid)
+    parent_created = get_process_creation_filetime(parent_pid)
+    if current_created is None or parent_created is None or parent_created > current_created:
+        return None
+    return parent_pid
+
+
 def get_tray_process_pids(exclude_current=True, snapshots=None):
     snapshots = get_process_snapshots() if snapshots is None else snapshots
     current_pid = os.getpid()
+    launcher_pid = get_venv_launcher_pid(snapshots) if exclude_current else None
     lock_identity = read_lock_identity()
     try:
         locked_pid = int(lock_identity.get("pid"))
@@ -644,7 +683,7 @@ def get_tray_process_pids(exclude_current=True, snapshots=None):
             allow_same_name=pid == locked_pid,
         ):
             continue
-        if exclude_current and pid == current_pid:
+        if exclude_current and pid in {current_pid, launcher_pid}:
             continue
         pids.add(pid)
     return pids
@@ -770,7 +809,11 @@ def hide_windows_by_pid(pids):
 
 
 class FinalmouseTray:
-    def __init__(self):
+    reconnect_label = "Reconnect Browser"
+
+    def __init__(self, *, use_browser=True):
+        if use_browser:
+            _load_browser_support()
         self.driver = None
         self.running = True
         self.icon = None
@@ -1017,8 +1060,14 @@ class FinalmouseTray:
             options.add_argument("--disable-extensions")
             options.add_argument("--disable-sync")
             options.add_argument("--disable-background-networking")
+            # The hidden tray never uses Chrome's address-bar WebUI pages.
+            options.add_argument(
+                "--disable-features=WebUIOmniboxPopup,WebUIOmniboxAimPopup,"
+                "WebUIOmniboxFullPopup,WebUIOmniboxPopupDebug"
+            )
             options.add_argument("--disable-gpu")
             options.add_argument("--mute-audio")
+            options.add_argument("--user-agent=OpenAI File Downloader, XaiImageApiFetch/1.0")
             options.add_argument("--log-level=3")
             options.add_argument("--window-size=800,600")
             options.add_argument("--window-position=-32000,-32000")
@@ -1070,21 +1119,6 @@ class FinalmouseTray:
         while self.running and not self.stop_event.wait(HIDER_INTERVAL):
             try:
                 now = time.monotonic()
-                if now - last_pid_refresh >= PID_REFRESH_INTERVAL_SECONDS:
-                    with self.browser_lock:
-                        snapshots = get_process_snapshots()
-                        self.browser_pids = get_owned_chrome_pids(snapshots)
-                        self.browser_creation_times = capture_process_creation_times(
-                            self.browser_pids
-                        )
-                        self.chrome_pids = set(self.browser_pids)
-                        if self.driver_pid and is_tracked_driver_snapshot(
-                            snapshots.get(self.driver_pid, {}),
-                            self.driver_creation_date,
-                        ):
-                            self.chrome_pids.add(self.driver_pid)
-                        self._save_pids(snapshots)
-                    last_pid_refresh = now
                 with self.browser_lock:
                     self.browser_pids = {
                         pid for pid in self.browser_pids
@@ -1098,6 +1132,13 @@ class FinalmouseTray:
                         pid: self.browser_creation_times[pid]
                         for pid in self.browser_pids
                     }
+                    if now - last_pid_refresh >= PID_REFRESH_INTERVAL_SECONDS:
+                        # The browser owns the visible windows across renderer
+                        # reloads. Rediscover only after the cached identities
+                        # disappear; startup, recovery and cleanup also rescan.
+                        if not self.browser_pids:
+                            self._has_live_browser_process()
+                        last_pid_refresh = now
                     self.chrome_pids = set(self.browser_pids)
                     if (
                         self.driver_pid
@@ -1829,7 +1870,7 @@ class FinalmouseTray:
                 reading = self.restart_browser("manual reconnect", force=True)
                 self._update_icon(reading)
 
-        self._run_menu_action("Reconnect Browser", reconnect)
+        self._run_menu_action(self.reconnect_label, reconnect)
 
     def on_toggle_dark_text(self, icon, item):
         with self.state_lock:
@@ -1887,7 +1928,7 @@ class FinalmouseTray:
         atexit.register(self.kill_chrome)
         try:
             if not self.start_browser():
-                print("Could not start browser. Exiting.", file=sys.stderr)
+                print("Could not initialize battery reader. Exiting.", file=sys.stderr)
                 sys.exit(1)
 
             initial_color = self._text_color()
@@ -1895,7 +1936,7 @@ class FinalmouseTray:
             self._display_key = ("battery", self.battery_pct, initial_color)
             menu = pystray.Menu(
                 pystray.MenuItem("Refresh", self.on_refresh),
-                pystray.MenuItem("Reconnect Browser", self.on_reconnect),
+                pystray.MenuItem(self.reconnect_label, self.on_reconnect),
                 pystray.MenuItem(
                     "Dark text",
                     self.on_toggle_dark_text,
@@ -1920,10 +1961,112 @@ class FinalmouseTray:
             self._join_worker_threads()
 
 
+class NativeFinalmouseTray(FinalmouseTray):
+    """Use the existing tray/history UI with a bounded native receiver reader."""
+
+    reconnect_label = "Reconnect Receiver"
+
+    def __init__(self, *, reader=None):
+        super().__init__(use_browser=False)
+        from native_hid import NativeBatteryReader
+        self.native_reader = reader if reader is not None else NativeBatteryReader()
+        self.last_native_error = None
+        self.last_native_error_at = 0.0
+
+    def start_browser(self):
+        # Base run() supplies the established tray/menu/shutdown lifecycle.
+        # A missing receiver does not prevent the tray from starting.
+        with self.browser_lock:
+            if not self.running or self.stop_event.is_set():
+                return False
+            # An unclean exit from the former browser mode can leave Chrome
+            # holding the receiver. Reuse its verified cleanup once at startup;
+            # native polling and menu actions never launch discovery helpers.
+            if not self._cleanup_previous():
+                return False
+            log_event("Started native ULX battery reader")
+            return self.running and not self.stop_event.is_set()
+
+    def kill_chrome(self):
+        if self.cleanup_complete:
+            return True
+        with self.browser_lock:
+            if not self.cleanup_complete:
+                self.native_reader.close()
+                self.cleanup_complete = True
+        return True
+
+    def read_battery(self):
+        from native_hid import BatteryReadError, DeviceUnavailable
+        if not self.running or self.stop_event.is_set():
+            return None
+        with self.browser_lock:
+            if not self.running or self.stop_event.is_set():
+                return None
+            try:
+                sample = self.native_reader.read()
+            except BatteryReadError as error:
+                now = time.monotonic()
+                reason = str(error)
+                if (reason != self.last_native_error
+                        or now - self.last_native_error_at >= EXPECTED_STATE_LOG_INTERVAL_SECONDS):
+                    log_event(f"Native battery reader: {reason}; preserving the last known reading")
+                    self.last_native_error, self.last_native_error_at = reason, now
+                return DISCONNECTED_READING if isinstance(error, DeviceUnavailable) else None
+            if self.last_native_error is not None:
+                log_event("Native battery reader recovered")
+                self.last_native_error = None
+            # Radio charging status and the verified wired USB connection both
+            # use the established charging UI. Wired mode has no voltage reply;
+            # preserve the session's starting percentage until wireless returns.
+            if sample.charging or sample.power_connected:
+                return CHARGING_READING
+            if (not sample.connected or sample.percent is None
+                    or sample.millivolts == 0):
+                return DISCONNECTED_READING
+            return format_pct(sample.percent)
+
+    def recover_browser(self, reason, force_restart=False, force_restart_on_failure=False):
+        if force_restart or force_restart_on_failure:
+            return self.restart_browser(reason, force=True)
+        return self.read_battery()
+
+    def restart_browser(self, reason, force=False):
+        if not self.running or self.stop_event.is_set():
+            return None
+        with self.browser_lock:
+            self.native_reader.close()
+            log_event(f"Reconnecting native receiver: {reason}")
+            return self.read_battery()
+
+    def poll_loop(self):
+        # Direct queries need neither page reloads nor browser-settle delays.
+        while self.running and not self.stop_event.is_set():
+            self.last_poll_heartbeat = time.monotonic()
+            try:
+                # Refresh/reconnect must not apply a newer sample between this
+                # read and its history/icon update.
+                with self.browser_lock:
+                    self._update_icon(self.read_battery())
+            except Exception as error:
+                log_event(f"Native poll recovered from error: {error.__class__.__name__}")
+            finally:
+                self.last_poll_heartbeat = time.monotonic()
+            if self.stop_event.wait(POLL_INTERVAL):
+                break
+
+    def _watchdog_check(self):
+        if not self.running or self.stop_event.is_set():
+            return
+        if self.poll_thread and not self.poll_thread.is_alive():
+            log_event("Native poll thread stopped; restarting polling")
+            self._start_poll_thread()
+
+
 if __name__ == "__main__":
     if not acquire_lock():
         print("Already running. Exiting.", file=sys.stderr)
         sys.exit(0)
     atexit.register(release_lock)
-    app = FinalmouseTray()
+    app = FinalmouseTray() if "--browser" in sys.argv[1:] else NativeFinalmouseTray()
     app.run()
