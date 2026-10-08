@@ -1,6 +1,6 @@
 @echo off
 setlocal DisableDelayedExpansion
-title Install Finalmouse Battery Tray
+title Install ULX Finalmouse Battery Tray
 cd /d "%~dp0" || goto folderError
 if not exist "requirements.txt" goto filesError
 if exist ".venv" goto validateEnvironment

@@ -1,15 +1,17 @@
-# Finalmouse Battery Tray
+# ULX Finalmouse Battery Tray
 
 A lightweight Windows tray monitor for Finalmouse ULX battery status. It reads the receiver directly through native HID, displays the battery percentage beside your clock, and shows a pulsing bolt for charging or a wired USB power connection.
 
 **Monitoring uses native HID only.** It polls every 10 seconds and saves your charge history and text-color preference locally.
+
+**This is the ULX version.** For Starlight X, use [SLX Finalmouse Battery Tray](https://github.com/saintordevil/slx-finalmouse-battery-tray). The ULX history folder stays unchanged when upgrading from the original repository.
 
 ## Install
 
 You need Windows 10/11, **64-bit Python 3.10 or newer**, and a compatible Finalmouse ULX mouse and receiver. Python 3.11 is the tested version. Physical validation used a ULX Prophecy Tfue Wireless, Small, on Windows 11; other models and firmware have not all been verified.
 
 1. Install [64-bit Python for Windows](https://www.python.org/downloads/windows/) if needed. Include the Python launcher or add Python to PATH.
-2. [Download the project ZIP](https://github.com/saintordevil/finalmouse-battery-tray/archive/refs/heads/master.zip) and extract the complete folder to a permanent location. You can also clone this repository.
+2. [Download the project ZIP](https://github.com/saintordevil/ulx-finalmouse-battery-tray/archive/refs/heads/master.zip) and extract the complete folder to a permanent location. You can also clone this repository.
 3. Double-click **`install.bat`**. Wait for **Installation complete**. It creates a local `.venv` and installs Pillow, pystray, and hidapi. Internet access is needed for this step.
 4. Connect the receiver, turn on the mouse, and double-click **`start.bat`**.
 5. If the icon is hidden, open the tray's hidden-icons arrow and drag it beside your clock.
@@ -59,7 +61,7 @@ The bolt with active-session details and the previous charge history.
 
 The tray menu: Refresh, Reconnect Receiver, Dark text, and Quit.
 
-![Finalmouse Battery Tray menu](assets/tray-menu.png)
+![ULX Finalmouse Battery Tray menu](assets/tray-menu.png)
 
 ## Troubleshooting
 

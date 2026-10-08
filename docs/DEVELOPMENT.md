@@ -5,7 +5,7 @@ Install the project first. Run these commands in Command Prompt, replacing the e
 The full regression suite uses the same native dependencies as the application:
 
 ```bat
-cd /d "C:\Users\User\Desktop\Programs\finalmouse-battery-tray"
+cd /d "C:\Users\User\Desktop\Programs\ulx-finalmouse-battery-tray"
 ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 ".venv\Scripts\python.exe" -B -m unittest discover -v
 ```

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-10-08: Separate ULX and SLX projects
+
+- Renamed the original project to `ulx-finalmouse-battery-tray`, preserving its Git history and the existing native ULX reader.
+- Updated installation labels, download links, and the README link to the separate SLX project.
+- Kept `%LOCALAPPDATA%\finalmouse-tray`, the existing ULX mutex, and saved ULX history compatible with previous installations. SLX uses a separate data folder and mutex.
+- The reader, UI, charge tracking, and polling behavior are unchanged by this rename. Current ULX hardware testing is limited by which device is connected; earlier physical validation is documented below.
+
 ## 2026-09-07: HID-only monitoring and updated previews
 
 ### What changed
@@ -39,4 +46,4 @@ Working set and private commit are different counters. Summed working sets may c
 
 The wired bolt indicates USB power connection, not measured charging current or a fresh wired percentage. Charge duration includes waiting for a fresh wireless reading. Multiple mice are not correlated; duplicate matching interfaces are rejected.
 
-Earlier changes are recorded in [the native-reader and installer update](https://github.com/saintordevil/finalmouse-battery-tray/pull/2) and [the tray reliability update](https://github.com/saintordevil/finalmouse-battery-tray/pull/1).
+Earlier changes are recorded in [the native-reader and installer update](https://github.com/saintordevil/ulx-finalmouse-battery-tray/pull/2) and [the tray reliability update](https://github.com/saintordevil/ulx-finalmouse-battery-tray/pull/1).

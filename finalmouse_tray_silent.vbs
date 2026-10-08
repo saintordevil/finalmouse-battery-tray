@@ -21,7 +21,7 @@ On Error Resume Next
 shell.Run command, 0, False
 launchError = Err.Number
 On Error GoTo 0
-If launchError <> 0 Then Fail "Could not start Finalmouse Battery Tray. Run install.bat to check the local environment."
+If launchError <> 0 Then Fail "Could not start ULX Finalmouse Battery Tray. Run install.bat to check the local environment."
 WScript.Quit 0
 
 Sub Fail(message)
